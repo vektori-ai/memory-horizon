@@ -16,7 +16,7 @@ import datetime
 from dataclasses import dataclass, field
 from typing import Any
 
-from memory_horizon.types import MemoryLayer, MemoryOp, MemoryOpAction
+from memory_horizon.mh_types import MemoryLayer, MemoryOp, MemoryOpAction
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 """memory_horizon — RL environment infrastructure for training Vektori's memory model."""
 
-from memory_horizon.types import (
+from memory_horizon.mh_types import (
     MemoryLayer,
     MemoryOp,
     MemoryOpAction,

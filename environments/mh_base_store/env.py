@@ -14,7 +14,7 @@ from typing import Callable
 
 from memory_horizon.base_env import MemoryHorizonEnv, make_env
 from memory_horizon.generator.session_gen import SessionGenerator
-from memory_horizon.types import Trajectory
+from memory_horizon.mh_types import Trajectory
 
 
 def make_store_env(

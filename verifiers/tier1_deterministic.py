@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from memory_horizon.memory_store import MemoryStore, StoreExecResult
-from memory_horizon.types import (
+from memory_horizon.mh_types import (
     MEMORY_OP_SCHEMA,
     CONFLICT_OPS,
     STORE_OPS,

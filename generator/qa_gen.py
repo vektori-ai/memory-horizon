@@ -25,7 +25,7 @@ from __future__ import annotations
 import random
 from typing import Any
 
-from memory_horizon.types import QAPair
+from memory_horizon.mh_types import QAPair
 
 
 # ---------------------------------------------------------------------------

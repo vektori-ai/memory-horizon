@@ -47,7 +47,7 @@ from memory_horizon.core import Env
 from memory_horizon.spaces.text import Text
 
 from memory_horizon.memory_store import MemoryStore
-from memory_horizon.types import (
+from memory_horizon.mh_types import (
     MemoryOp,
     MemoryOpAction,
     QAPair,

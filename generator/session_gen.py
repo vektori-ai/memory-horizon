@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from memory_horizon.memory_store import MemoryStore
-from memory_horizon.types import (
+from memory_horizon.mh_types import (
     ConflictExample,
     MemoryOp,
     QAPair,
@@ -351,7 +351,7 @@ class SessionGenerator:
             turn_idx += 1
 
             # Simulate the oracle storing this fact.
-            from memory_horizon.types import MemoryOpAction, MemoryLayer
+            from memory_horizon.mh_types import MemoryOpAction, MemoryLayer
             oracle_store.execute(MemoryOpAction(
                 op=MemoryOp.STORE_FACT,
                 content=value,

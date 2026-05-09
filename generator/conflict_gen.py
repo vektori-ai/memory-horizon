@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from memory_horizon.types import ConflictExample, MemoryOp
+from memory_horizon.mh_types import ConflictExample, MemoryOp
 
 
 # ---------------------------------------------------------------------------
