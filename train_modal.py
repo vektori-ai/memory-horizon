@@ -26,7 +26,7 @@ DATA_PATH_LOCAL = REPO_ROOT / "data" / "debt_collection.jsonl"
 
 MODEL_ID    = "Qwen/Qwen3-8B"
 N_ROLLOUTS  = 4      # completions per prompt (GRPO group size)
-N_STEPS     = 30   # bump to 200 once rewards look healthy
+N_STEPS     = 200
 LR          = 2e-6
 
 VERL_REPO_PATH = Path("/root/verl")
@@ -93,7 +93,21 @@ def prep(jsonl_data: str) -> None:
 # ---------------------------------------------------------------------------
 # Reward function  —  called by verl at training time
 # verl signature: compute_reward(data_source, solution_str, ground_truth, extra_info) -> float
+#
+# Two-tier reward:
+#   Tier 1 (weight 0.3): deterministic format/schema checks — JSON valid,
+#                        op in allowed set, key snake_case, content non-empty
+#                        and not a verbatim copy of the transcript.
+#   Tier 3 (weight 0.7): token F1 / keyword recall against the QA gold answer.
 # ---------------------------------------------------------------------------
+
+_VALID_OPS = {
+    "STORE_FACT", "CREATE_EPISODE", "INFER_IMPLICIT",
+    "UPDATE", "SUPERSEDE", "DECAY", "KEEP_BOTH", "COMPRESS", "ABSTAIN",
+}
+
+_KEY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+
 
 def compute_reward(
     data_source: str,
@@ -101,15 +115,75 @@ def compute_reward(
     ground_truth: str,
     extra_info: dict,
 ) -> float:
+    tier1 = _tier1_score(solution_str, extra_info.get("conv_text", ""))
+
+    # Unparseable output — no point scoring content quality.
+    if tier1 <= -1.0:
+        return -1.0
+
     content = _extract_content_field(solution_str)
-    # Categorical enum labels (all-caps): score by keyword recall against core
-    # concepts. F1 would penalise the model for storing a full sentence vs a
-    # short label, so recall is the right signal here.
     if re.match(r"^[A-Z][A-Z0-9_]+$", ground_truth):
-        return _categorical_score(content, ground_truth)
-    # Free-form / natural language: token F1 with a lenient threshold.
-    f1 = _token_f1(content, ground_truth)
-    return 1.0 if f1 >= 0.5 else f1
+        tier3 = _categorical_score(content, ground_truth)
+    else:
+        f1 = _token_f1(content, ground_truth)
+        tier3 = 1.0 if f1 >= 0.5 else f1
+
+    return max(-1.0, min(1.0, 0.3 * tier1 + 0.7 * tier3))
+
+
+def _tier1_score(solution_str: str, conv_text: str = "") -> float:
+    """Deterministic format checks — mirrors Tier1Verifier without the full env.
+
+    Returns a score in [-1, +1]:
+        +1.0  all checks pass
+        deductions for each violation (see inline comments)
+        -1.0  no parseable JSON found
+    """
+    cleaned = re.sub(r"<think>.*?</think>", "", solution_str, flags=re.DOTALL).strip()
+
+    m = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if not m:
+        return -1.0
+    try:
+        d = json.loads(m.group())
+    except json.JSONDecodeError:
+        return -1.0
+
+    score = 1.0
+
+    # Required fields — each missing one costs 0.3.
+    for field_name in ("op", "content", "key"):
+        if not d.get(field_name):
+            score -= 0.3
+
+    if score < 0.1:
+        return max(-1.0, score)
+
+    # Op must be a recognised memory operation.
+    if d.get("op", "") not in _VALID_OPS:
+        score -= 0.3
+
+    # Key must be lowercase snake_case.
+    key = d.get("key", "")
+    if key and not _KEY_RE.match(key):
+        score -= 0.3
+
+    # Confidence must be in [0, 1] if present.
+    conf = d.get("confidence", 1.0)
+    if not isinstance(conf, (int, float)) or not (0.0 <= float(conf) <= 1.0):
+        score -= 0.1
+
+    # Content must not be a verbatim copy of the transcript (≥90% word overlap).
+    content = d.get("content", "")
+    if conv_text and content and len(content.split()) > 5:
+        transcript_words = set(conv_text.lower().split())
+        content_words = set(content.lower().split())
+        if transcript_words:
+            overlap = len(content_words & transcript_words) / len(content_words)
+            if overlap >= 0.90:
+                score -= 0.5
+
+    return max(-1.0, min(1.0, score))
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +338,27 @@ def eval(run_name: str = "debt_collection_run_001", step: int = -1):
 # ---------------------------------------------------------------------------
 
 @app.local_entrypoint()
+def prep_data():
+    """Rebuild the parquet dataset only. Run this after changing the system prompt."""
+    if not DATA_PATH_LOCAL.exists():
+        print(f"Data not found at {DATA_PATH_LOCAL}")
+        print("Run: python3 convert_calls.py")
+        return
+    jsonl_data = DATA_PATH_LOCAL.read_text()
+    print(f"Loaded {jsonl_data.count(chr(10))} trajectories — rebuilding parquet...")
+    prep.remote(jsonl_data=jsonl_data)
+    print("Done. Run 'modal run train_modal.py::train_only' to start training.")
+
+
+@app.local_entrypoint()
+def train_only():
+    """Train using existing parquet on the data volume (skips data prep)."""
+    print("Starting GRPO training...")
+    result = train.remote(run_name="debt_collection_run_001")
+    print("Done:", result)
+
+
+@app.local_entrypoint()
 def main():
     if not DATA_PATH_LOCAL.exists():
         print(f"Data not found at {DATA_PATH_LOCAL}")
@@ -349,7 +444,7 @@ def _build_verl_examples(jsonl_data: str) -> list[dict]:
                 "prompt":       prompt,
                 "ability":      "memory_extraction",
                 "reward_model": {"ground_truth": answer},
-                "extra_info":   {"question": question},
+                "extra_info":   {"question": question, "conv_text": conv_text},
             })
 
     return examples
@@ -467,7 +562,8 @@ def _categorical_score(content: str, label: str) -> float:
     in the stored content starts with that prefix (handling inflections like
     dispute/disputes, refuse/refused without a full stemmer).
 
-    Returns the fraction of prefixes matched (1.0 = all hit).
+    Returns the fraction of prefixes matched (1.0 = all hit), minus a penalty
+    for keyword-stuffing (hitting prefixes from other outcome categories).
     Unknown labels fall back to token F1 against the auto-expanded phrase.
     """
     keywords = _LABEL_KEYWORDS.get(label)
@@ -481,7 +577,18 @@ def _categorical_score(content: str, label: str) -> float:
         1 for kw in keywords
         if any(t.startswith(kw) for t in content_tokens)
     )
-    return hits / len(keywords)
+    recall = hits / len(keywords)
+
+    # Anti-stuffing penalty: count how many OTHER outcome categories also fire.
+    # A legitimate response should only match the correct category's keywords.
+    other_categories_hit = sum(
+        1 for other_label, other_kws in _LABEL_KEYWORDS.items()
+        if other_label != label
+        and all(any(t.startswith(kw) for t in content_tokens) for kw in other_kws)
+    )
+    penalty = 0.2 * other_categories_hit
+
+    return max(0.0, recall - penalty)
 
 
 def _normalize(text: str) -> list[str]:
