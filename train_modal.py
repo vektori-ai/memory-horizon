@@ -223,8 +223,8 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS) -> dict:
         f"data.train_files={DATA_PATH / 'train.parquet'}",
         f"data.val_files={DATA_PATH / 'val.parquet'}",
         "data.train_batch_size=8",       # prompts per step; total rollouts = 8 × N_ROLLOUTS
-        "data.max_prompt_length=1024",
-        "data.max_response_length=768",
+        "data.max_prompt_length=3072",
+        "data.max_response_length=512",
         "data.filter_overlong_prompts=True",
         "data.truncation=right",
         # model + LoRA (cuts optimizer states from 32 GB → ~320 MB)
@@ -447,7 +447,7 @@ def _build_verl_examples(jsonl_data: str) -> list[dict]:
         conv_text = _format_conversation(all_turns)
 
         # Truncate if too long for context window (keep last N tokens worth)
-        MAX_CONV_CHARS = 12_000
+        MAX_CONV_CHARS = 8_000
         if len(conv_text) > MAX_CONV_CHARS:
             conv_text = conv_text[-MAX_CONV_CHARS:]
 
