@@ -318,7 +318,7 @@ def prep_data():
     """Rebuild the parquet dataset only. Run this after changing the system prompt."""
     if not DATA_PATH_LOCAL.exists():
         print(f"Data not found at {DATA_PATH_LOCAL}")
-        print("Run: python3 convert_calls.py")
+        print("Run: python3 data/converters/locomo_converter.py && python3 data/converters/longmemeval_converter.py")
         return
     jsonl_data = DATA_PATH_LOCAL.read_text()
     print(f"Loaded {jsonl_data.count(chr(10))} trajectories — rebuilding parquet...")
@@ -351,7 +351,7 @@ def train_only():
 def main():
     if not DATA_PATH_LOCAL.exists():
         print(f"Data not found at {DATA_PATH_LOCAL}")
-        print("Run: python3 convert_calls.py")
+        print("Run: python3 data/converters/locomo_converter.py && python3 data/converters/longmemeval_converter.py")
         return
 
     jsonl_data = DATA_PATH_LOCAL.read_text()
