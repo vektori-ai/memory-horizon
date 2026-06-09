@@ -48,7 +48,7 @@ image = (
     .apt_install("git")
     .run_commands(f"git clone https://github.com/volcengine/verl {VERL_REPO_PATH}")
     .uv_pip_install("verl[vllm]==0.4.1", "pandas", "pyarrow")
-    .copy_local_file(Path(__file__).parent / "patch_verl.py", "/root/patch_verl.py")
+    .add_local_file(Path(__file__).parent / "patch_verl.py", "/root/patch_verl.py")
     .run_commands("python /root/patch_verl.py")
     .env({
         "HF_HOME": "/hf-cache",
@@ -211,7 +211,7 @@ def _tier1_score(solution_str: str, conv_text: str = "") -> float:
     },
     secrets=[modal.Secret.from_name("huggingface-secret"), modal.Secret.from_name("wandb-secret")],
 )
-def train(run_name: str = "locomo_lme_run_001") -> dict:
+def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS) -> dict:
     data_volume.reload()
 
     cmd = [
@@ -264,9 +264,9 @@ def train(run_name: str = "locomo_lme_run_001") -> dict:
         f"trainer.experiment_name={run_name}",
         "trainer.n_gpus_per_node=2",
         "trainer.nnodes=1",
-        "trainer.test_freq=20",
-        "trainer.save_freq=50",
-        f"trainer.total_training_steps={N_STEPS}",
+        f"trainer.test_freq={min(10, n_steps)}",
+        f"trainer.save_freq={min(25, n_steps)}",
+        f"trainer.total_training_steps={n_steps}",
         f"trainer.default_local_dir={MODELS_PATH / run_name}",
         "trainer.resume_mode=auto",
         # reward
@@ -277,7 +277,7 @@ def train(run_name: str = "locomo_lme_run_001") -> dict:
     result = subprocess.run(cmd, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"verl exited with status {result.returncode}:\n{result.stderr[-4000:]}")
-    return {"run_name": run_name, "steps": N_STEPS, "checkpoint": str(MODELS_PATH / run_name)}
+    return {"run_name": run_name, "steps": n_steps, "checkpoint": str(MODELS_PATH / run_name)}
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +358,19 @@ def prep_data():
     print(f"Loaded {jsonl_data.count(chr(10))} trajectories — rebuilding parquet...")
     prep.remote(jsonl_data=jsonl_data)
     print("Done. Run 'modal run train_modal.py::train_only' to start training.")
+
+
+@app.local_entrypoint()
+def sanity():
+    """Sanity run — 20 steps on existing parquet. Confirms the full pipeline works (~$7).
+
+    Run: python3.10 -m modal run train_modal.py::sanity
+    """
+    print("Starting sanity run (20 steps)...")
+    jsonl_data = DATA_PATH_LOCAL.read_text()
+    prep.remote(jsonl_data=jsonl_data)
+    result = train.remote(run_name="sanity_001", n_steps=20)
+    print("Sanity run done:", result)
 
 
 @app.local_entrypoint()
