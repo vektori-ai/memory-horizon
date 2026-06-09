@@ -478,7 +478,7 @@ def _extract_content_field(completion: str) -> str:
     m = re.search(r'"content"\s*:\s*"([^"]+)"', completion)
     if m:
         return m.group(1)
-    return completion
+    return ""
 
 
 def _rouge1_recall(hypothesis: str, reference: str) -> float:
