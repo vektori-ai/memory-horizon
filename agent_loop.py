@@ -94,7 +94,12 @@ def build_verl_batch(
         if not all_turns:
             continue
 
-        qa_probes = traj.get("qa_probes", [])
+        # Normalize answer types to str so pyarrow doesn't infer int64 from
+        # numeric answers and then fail on string answers in the same column.
+        qa_probes = [
+            {**p, "answer": str(p.get("answer", ""))}
+            for p in traj.get("qa_probes", [])
+        ]
 
         # Sliding windows over the flattened turn list
         for win_start in range(0, max(1, len(all_turns) - window_size + 1), stride):
