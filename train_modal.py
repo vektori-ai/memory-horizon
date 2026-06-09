@@ -47,7 +47,7 @@ image = (
     modal.Image.from_registry("verlai/verl:app-verl0.5-sglang0.4.8-mcore0.12.2-te2.2")
     .apt_install("git")
     .run_commands(f"git clone https://github.com/volcengine/verl {VERL_REPO_PATH}")
-    .uv_pip_install("verl[sglang]==0.5.0", "pandas", "pyarrow")
+    .uv_pip_install("pandas", "pyarrow")  # verl+sglang+flash_attn already baked into base image
     .add_local_file(Path(__file__).parent / "patch_verl.py",  "/root/patch_verl.py",  copy=True)
     .add_local_file(Path(__file__).parent / "reward.py",      "/root/reward.py",      copy=True)
     .add_local_file(Path(__file__).parent / "memory_fs.py",   "/root/memory_fs.py",   copy=True)
