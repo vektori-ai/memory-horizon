@@ -9,14 +9,12 @@ from __future__ import annotations
 
 import json
 import re
-import string
 from collections import Counter
+
+from memory_fs import _token_f1, _normalize
 
 _VALID_OPS            = {"STORE_FACT", "UPDATE", "SUPERSEDE", "COMPRESS", "ABSTAIN"}
 _CONTENT_OPTIONAL_OPS = {"ABSTAIN"}
-
-_STOP = {"what", "is", "the", "are", "was", "were", "a", "an", "this", "that",
-         "of", "for", "in", "on", "at", "to", "does", "did", "has", "have", "had"}
 
 
 def compute_reward(
@@ -48,33 +46,6 @@ def compute_reward(
     # +0.1 bonus for any valid op that stores content (anti-collapse pressure)
     return max(-1.0, min(1.0, 0.6 * r_task + 0.4 * r_memory - p_volume + 0.1))
 
-
-def score_trajectory(fs_render: str, qa_probes_json: str) -> float:
-    """Terminal reward for Architecture B (multi-turn AgentLoop).
-
-    Args:
-        fs_render:      serialised VirtualFilesystem.render_for_prompt() output
-        qa_probes_json: JSON-serialised list of QAPair dicts
-
-    Returns average token-F1 of grepped FS content vs each answer.
-    Called once at episode end; step-wise GRPO broadcasts this to all prior turns.
-    """
-    try:
-        probes = json.loads(qa_probes_json) if isinstance(qa_probes_json, str) else qa_probes_json
-    except (json.JSONDecodeError, TypeError):
-        return 0.0
-
-    scores = []
-    for probe in probes:
-        answer = str(probe.get("answer", ""))
-        if not answer or answer in ("ABSTAIN", "Yes", "No", "N/A", ""):
-            continue
-
-        question = probe.get("question", "")
-        relevant = _grep_relevant(fs_render, question)
-        scores.append(_token_f1(relevant, answer))
-
-    return sum(scores) / len(scores) if scores else 0.0
 
 
 def _is_valid_memory_op(solution_str: str) -> bool:
@@ -124,15 +95,6 @@ def _extract_content_field(completion: str) -> str:
     return ""
 
 
-def _grep_relevant(fs_text: str, question: str) -> str:
-    q_tokens = set(_normalize(question))
-    if not q_tokens or not fs_text.strip():
-        return fs_text
-    lines    = fs_text.split("\n")
-    relevant = [l for l in lines if any(t in l.lower() for t in q_tokens)]
-    return " ".join(relevant) if relevant else fs_text
-
-
 def _rouge1_recall(hypothesis: str, reference: str) -> float:
     hyp = _normalize(hypothesis)
     ref = _normalize(reference)
@@ -145,24 +107,3 @@ def _rouge1_recall(hypothesis: str, reference: str) -> float:
     return sum((hyp_c & ref_c).values()) / len(ref)
 
 
-def _token_f1(prediction: str, gold: str) -> float:
-    pred_tokens = _normalize(prediction)
-    gold_tokens = _normalize(gold)
-
-    if not pred_tokens and not gold_tokens:
-        return 1.0
-    if not pred_tokens or not gold_tokens:
-        return 0.0
-
-    common    = sum((Counter(pred_tokens) & Counter(gold_tokens)).values())
-    precision = common / len(pred_tokens)
-    recall    = common / len(gold_tokens)
-    if precision + recall == 0:
-        return 0.0
-    return 2 * precision * recall / (precision + recall)
-
-
-def _normalize(text: str) -> list[str]:
-    text = text.lower()
-    text = text.translate(str.maketrans("", "", string.punctuation))
-    return [t for t in text.split() if t not in _STOP]

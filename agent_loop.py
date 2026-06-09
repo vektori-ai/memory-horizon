@@ -48,8 +48,8 @@ Output a single JSON object (no explanation):
 
 Op rules:
   STORE_FACT  : new fact not yet stored; path = category/entity (e.g. people/alice)
-  UPDATE      : add new detail to existing path (old lines kept)
-  SUPERSEDE   : old value was wrong, replace entirely
+  UPDATE      : existing fact changed or was wrong — replace current entry at path
+  SUPERSEDE   : stronger overwrite — all prior entries at path replaced by this one
   COMPRESS    : collapse verbose path lines into one summary
   ABSTAIN     : no storable information in this turn
 /nothink"""

@@ -43,7 +43,7 @@ class VirtualFilesystem:
 
         tagged = f"{content} [s={session_idx} t={turn_idx}]"
 
-        if op_type in ("SUPERSEDE", "COMPRESS"):
+        if op_type in ("UPDATE", "SUPERSEDE", "COMPRESS"):
             self.files[path] = [tagged]
         else:
             self.files.setdefault(path, []).append(tagged)
@@ -118,7 +118,9 @@ def _grep_relevant(fs_text: str, question: str) -> str:
         return fs_text
     lines    = fs_text.split("\n")
     relevant = [l for l in lines if any(t in l.lower() for t in q_tokens)]
-    return " ".join(relevant) if relevant else fs_text
+    # Return "" (not full fs_text) when nothing matches — cleaner training signal;
+    # falling back to the full FS would give noisy credit for irrelevant content.
+    return " ".join(relevant)
 
 
 def _token_f1(prediction: str, gold: str) -> float:
