@@ -96,8 +96,8 @@ _VALID_OPS = {
     "STORE_FACT", "CREATE_EPISODE", "INFER_IMPLICIT",
     "UPDATE", "SUPERSEDE", "DECAY", "KEEP_BOTH", "COMPRESS", "ABSTAIN",
 }
-
-_KEY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+# Ops that legitimately produce no content (model chose not to store anything).
+_CONTENT_OPTIONAL_OPS = {"ABSTAIN", "DECAY"}
 
 
 def compute_reward(
@@ -106,21 +106,13 @@ def compute_reward(
     ground_truth: str,
     extra_info: dict,
 ) -> float:
-    """Vektori reward function.
+    """Vektori reward: R = 0.6 * token_F1 + 0.4 * ROUGE1_recall - volume_penalty.
 
-    R = 0.6 * R_task + 0.4 * R_memory - P_volume
-
-    R_task   — token F1 between extracted content and gold QA answer
-    R_memory — ROUGE-1 recall of extracted content against gold answer
-               (measures whether stored fact contains the answer tokens)
-    P_volume — penalty for overly long stored content (teaches concision)
-    Format gate — unparseable JSON returns 0.0 immediately
+    Format gate: invalid/unparseable op → -0.5 (penalised, not neutral).
+    ABSTAIN / DECAY with no content → 0.0 (model chose not to store; no signal).
     """
-    tier1 = _tier1_score(solution_str, extra_info.get("conv_text", ""))
-
-    # Hard gate: unparseable output wastes no gradient
-    if tier1 <= -1.0:
-        return 0.0
+    if not _is_valid_memory_op(solution_str):
+        return -0.5
 
     content = _extract_content_field(solution_str)
     if not content:
@@ -130,63 +122,35 @@ def compute_reward(
     r_memory = _rouge1_recall(content, ground_truth)
     p_volume = min(0.002 * len(content.split()), 0.3)
 
-    reward = 0.6 * r_task + 0.4 * r_memory - p_volume
-    return max(-1.0, min(1.0, reward))
+    return max(-1.0, min(1.0, 0.6 * r_task + 0.4 * r_memory - p_volume))
 
 
-def _tier1_score(solution_str: str, conv_text: str = "") -> float:
-    """Deterministic format checks — mirrors Tier1Verifier without the full env.
+def _is_valid_memory_op(solution_str: str) -> bool:
+    """Gate: does the output contain a parseable JSON with a valid op and content?
 
-    Returns a score in [-1, +1]:
-        +1.0  all checks pass
-        deductions for each violation (see inline comments)
-        -1.0  no parseable JSON found
+    Returns False (→ -0.5 penalty) if:
+      - no JSON found
+      - JSON unparseable
+      - op missing or not in _VALID_OPS
+      - content missing/empty for ops that require it
     """
     cleaned = re.sub(r"<think>.*?</think>", "", solution_str, flags=re.DOTALL).strip()
-
     m = re.search(r"\{.*\}", cleaned, re.DOTALL)
     if not m:
-        return -1.0
+        return False
     try:
         d = json.loads(m.group())
     except json.JSONDecodeError:
-        return -1.0
+        return False
 
-    score = 1.0
+    op = d.get("op", "")
+    if op not in _VALID_OPS:
+        return False
 
-    # Required fields — each missing one costs 0.3.
-    for field_name in ("op", "content", "key"):
-        if not d.get(field_name):
-            score -= 0.3
+    if op not in _CONTENT_OPTIONAL_OPS and not d.get("content"):
+        return False
 
-    if score < 0.1:
-        return max(-1.0, score)
-
-    # Op must be a recognised memory operation.
-    if d.get("op", "") not in _VALID_OPS:
-        score -= 0.3
-
-    # Key must be lowercase snake_case.
-    key = d.get("key", "")
-    if key and not _KEY_RE.match(key):
-        score -= 0.3
-
-    # Confidence must be in [0, 1] if present.
-    conf = d.get("confidence", 1.0)
-    if not isinstance(conf, (int, float)) or not (0.0 <= float(conf) <= 1.0):
-        score -= 0.1
-
-    # Content must not be a verbatim copy of the transcript (≥90% word overlap).
-    content = d.get("content", "")
-    if conv_text and content and len(content.split()) > 5:
-        transcript_words = set(conv_text.lower().split())
-        content_words = set(content.lower().split())
-        if transcript_words:
-            overlap = len(content_words & transcript_words) / len(content_words)
-            if overlap >= 0.90:
-                score -= 0.5
-
-    return max(-1.0, min(1.0, score))
+    return True
 
 
 # ---------------------------------------------------------------------------
