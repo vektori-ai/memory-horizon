@@ -439,7 +439,7 @@ def _build_verl_examples(trajectories: list[dict]) -> list[dict]:
                 "prompt":       prompt,
                 "ability":      "memory_extraction",
                 "reward_model": {"ground_truth": answer},
-                "extra_info":   {"question": question, "conv_text": conv_text[:2000]},
+                "extra_info":   {"question": question},
             })
 
     return examples
