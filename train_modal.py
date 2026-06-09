@@ -48,10 +48,8 @@ image = (
     .apt_install("git")
     .run_commands(f"git clone https://github.com/volcengine/verl {VERL_REPO_PATH}")
     .uv_pip_install("verl[vllm]==0.4.1", "pandas", "pyarrow")
-    .run_commands(
-        "sed -i 's/self\\.actor_optimizer\\.step()/torch.cuda.empty_cache(); self.actor_optimizer.step()/' "
-        "/usr/local/lib/python3.10/dist-packages/verl/workers/actor/dp_actor.py"
-    )
+    .copy_local_file(Path(__file__).parent / "patch_verl.py", "/root/patch_verl.py")
+    .run_commands("python /root/patch_verl.py")
     .env({
         "HF_HOME": "/hf-cache",
         "TOKENIZERS_PARALLELISM": "false",
