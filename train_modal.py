@@ -27,7 +27,6 @@ DATA_PATH_LOCAL = REPO_ROOT / "data" / "train.jsonl"
 MODEL_ID    = "Qwen/Qwen3-8B"
 N_ROLLOUTS  = 4      # completions per prompt (GRPO group size)
 N_STEPS     = 200
-LR          = 2e-6
 
 VERL_REPO_PATH = Path("/root/verl")
 DATA_PATH      = Path("/data")
