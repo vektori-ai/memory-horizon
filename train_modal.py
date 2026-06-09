@@ -22,7 +22,7 @@ import modal
 # ---------------------------------------------------------------------------
 
 REPO_ROOT = Path(__file__).parent
-DATA_PATH_LOCAL = REPO_ROOT / "data" / "debt_collection.jsonl"
+DATA_PATH_LOCAL = REPO_ROOT / "data" / "train.jsonl"
 
 MODEL_ID    = "Qwen/Qwen3-8B"
 N_ROLLOUTS  = 4      # completions per prompt (GRPO group size)
@@ -115,20 +115,32 @@ def compute_reward(
     ground_truth: str,
     extra_info: dict,
 ) -> float:
+    """Vektori reward function.
+
+    R = 0.6 * R_task + 0.4 * R_memory - P_volume
+
+    R_task   — token F1 between extracted content and gold QA answer
+    R_memory — ROUGE-1 recall of extracted content against gold answer
+               (measures whether stored fact contains the answer tokens)
+    P_volume — penalty for overly long stored content (teaches concision)
+    Format gate — unparseable JSON returns 0.0 immediately
+    """
     tier1 = _tier1_score(solution_str, extra_info.get("conv_text", ""))
 
-    # Unparseable output — no point scoring content quality.
+    # Hard gate: unparseable output wastes no gradient
     if tier1 <= -1.0:
-        return -1.0
+        return 0.0
 
     content = _extract_content_field(solution_str)
-    if re.match(r"^[A-Z][A-Z0-9_]+$", ground_truth):
-        tier3 = _categorical_score(content, ground_truth)
-    else:
-        f1 = _token_f1(content, ground_truth)
-        tier3 = 1.0 if f1 >= 0.5 else f1
+    if not content:
+        return 0.0
 
-    return max(-1.0, min(1.0, 0.3 * tier1 + 0.7 * tier3))
+    r_task   = _token_f1(content, ground_truth)
+    r_memory = _rouge1_recall(content, ground_truth)
+    p_volume = min(0.002 * len(content.split()), 0.3)
+
+    reward = 0.6 * r_task + 0.4 * r_memory - p_volume
+    return max(-1.0, min(1.0, reward))
 
 
 def _tier1_score(solution_str: str, conv_text: str = "") -> float:
@@ -201,7 +213,7 @@ def _tier1_score(solution_str: str, conv_text: str = "") -> float:
     },
     secrets=[modal.Secret.from_name("huggingface-secret"), modal.Secret.from_name("wandb-secret")],
 )
-def train(run_name: str = "debt_collection_run_001") -> dict:
+def train(run_name: str = "locomo_lme_run_001") -> dict:
     data_volume.reload()
 
     cmd = [
@@ -281,7 +293,7 @@ def train(run_name: str = "debt_collection_run_001") -> dict:
     volumes={MODELS_PATH: checkpoints_volume, "/hf-cache": hf_cache_vol},
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
-def eval(run_name: str = "debt_collection_run_001", step: int = -1):
+def eval(run_name: str = "locomo_lme_run_001", step: int = -1):
     from transformers import AutoTokenizer, AutoModelForCausalLM
     from peft import PeftModel
     import torch, glob, os
@@ -354,7 +366,7 @@ def prep_data():
 def train_only():
     """Train using existing parquet on the data volume (skips data prep)."""
     print("Starting GRPO training...")
-    result = train.remote(run_name="debt_collection_run_001")
+    result = train.remote(run_name="locomo_lme_run_001")
     print("Done:", result)
 
 
@@ -371,7 +383,7 @@ def main():
     prep.remote(jsonl_data=jsonl_data)
 
     print("Starting GRPO training with verl + vLLM...")
-    result = train.remote(run_name="debt_collection_run_001")
+    result = train.remote(run_name="locomo_lme_run_001")
     print("Done:", result)
 
 
@@ -380,19 +392,20 @@ def main():
 # ---------------------------------------------------------------------------
 
 _SYSTEM_PROMPT = """\
-You are a memory manager for an AI calling agent. Your job is to extract and store \
-the key facts from each conversation turn into a structured memory operation.
+You are a memory manager for a conversational AI agent. \
+Given a conversation, extract and store the key facts that would help answer questions later.
 
-Output a single JSON object with this schema:
-{"op": "<STORE_FACT|UPDATE|SUPERSEDE|ABSTAIN>", "content": "<what to remember>", "key": "<snake_case_key>", "confidence": <0.0-1.0>}
+Output a single JSON object:
+{"op": "<STORE_FACT|UPDATE|SUPERSEDE|COMPRESS|ABSTAIN>", "content": "<what to remember>", "key": "<snake_case_key>", "confidence": <0.0-1.0>}
 
 Rules:
-- STORE_FACT: new information not yet in memory
-- UPDATE: fact you already stored has changed (customer changed their mind)
-- SUPERSEDE: old fact was wrong, new fact replaces it permanently
-- ABSTAIN: this turn contains no storable memory (small talk, silence, wrong number)
+- STORE_FACT: new fact not yet in memory
+- UPDATE: a fact you already stored has changed
+- SUPERSEDE: old fact was wrong, replace it permanently
+- COMPRESS: summarise a long memory entry into a shorter one
+- ABSTAIN: no storable information in this conversation
 - Keep content concise — one sentence max
-- key must be lowercase snake_case (e.g. payment_amount, callback_date)
+- key must be lowercase snake_case (e.g. user_name, last_location, job_title)
 /nothink"""
 
 
@@ -415,15 +428,24 @@ def _build_verl_examples(jsonl_data: str) -> list[dict]:
         sessions = traj.get("sessions", [])
         if not sessions:
             continue
-        turns = sessions[0].get("turns", [])
-        conv_text = _format_conversation(turns)
+
+        # Use ALL sessions — not just the first one.
+        # For long conversations (LoCoMo has 19-35 sessions) we concatenate
+        # all turns so the model sees the full context when deciding what to store.
+        all_turns = [t for s in sessions for t in s.get("turns", [])]
+        conv_text = _format_conversation(all_turns)
+
+        # Truncate if too long for context window (keep last N tokens worth)
+        MAX_CONV_CHARS = 12_000
+        if len(conv_text) > MAX_CONV_CHARS:
+            conv_text = conv_text[-MAX_CONV_CHARS:]
+
+        data_source = traj.get("vertical", "locomo")
 
         for probe in traj.get("qa_probes", []):
             question = probe.get("question", "")
-            answer   = probe.get("answer", "")
-            # Skip unanswerable probes: ABSTAIN labels carry no signal, and
-            # Yes/No booleans can't be matched against a stored sentence via F1.
-            if not question or not answer or answer in ("ABSTAIN", "Yes", "No"):
+            answer   = str(probe.get("answer", ""))
+            if not question or not answer or answer in ("ABSTAIN", "Yes", "No", ""):
                 continue
 
             prompt = [
@@ -440,11 +462,11 @@ def _build_verl_examples(jsonl_data: str) -> list[dict]:
             ]
 
             examples.append({
-                "data_source":  "debt_collection",
+                "data_source":  data_source,
                 "prompt":       prompt,
                 "ability":      "memory_extraction",
                 "reward_model": {"ground_truth": answer},
-                "extra_info":   {"question": question, "conv_text": conv_text},
+                "extra_info":   {"question": question, "conv_text": conv_text[:2000]},
             })
 
     return examples
@@ -484,6 +506,20 @@ def _extract_content_field(completion: str) -> str:
     if m:
         return m.group(1)
     return completion
+
+
+def _rouge1_recall(hypothesis: str, reference: str) -> float:
+    """ROUGE-1 recall: fraction of reference tokens found in hypothesis."""
+    hyp = _normalize(hypothesis)
+    ref = _normalize(reference)
+    if not ref:
+        return 1.0
+    if not hyp:
+        return 0.0
+    hyp_c = Counter(hyp)
+    ref_c = Counter(ref)
+    common = sum((hyp_c & ref_c).values())
+    return common / len(ref)
 
 
 def _token_f1(prediction: str, gold: str) -> float:
