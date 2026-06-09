@@ -72,19 +72,33 @@ hf_cache_vol       = modal.Volume.from_name("hf-model-cache",          create_if
 )
 def prep(jsonl_data: str) -> None:
     import pandas as pd
+    import random
 
-    examples = _build_verl_examples(jsonl_data)
-    print(f"Built {len(examples)} examples")
+    trajectories = [
+        json.loads(line) for line in jsonl_data.strip().split("\n") if line.strip()
+    ]
 
-    split = int(len(examples) * 0.9)
-    train_df = pd.DataFrame(examples[:split])
-    val_df   = pd.DataFrame(examples[split:])
+    # Split at trajectory level to prevent conversation leakage into val.
+    # Shuffle deterministically so reruns are stable.
+    random.seed(42)
+    random.shuffle(trajectories)
+    cut = max(1, int(len(trajectories) * 0.9))
+    train_trajs, val_trajs = trajectories[:cut], trajectories[cut:]
+
+    # Edge case: if only one trajectory (e.g. LoCoMo-only run), keep it all in
+    # train and mirror it as val — better than an empty val set.
+    if not val_trajs:
+        val_trajs = train_trajs
+
+    train_examples = _build_verl_examples(train_trajs)
+    val_examples   = _build_verl_examples(val_trajs)
+    print(f"Trajectories — train: {len(train_trajs)}, val: {len(val_trajs)}")
+    print(f"Examples     — train: {len(train_examples)}, val: {len(val_examples)}")
 
     DATA_PATH.mkdir(parents=True, exist_ok=True)
-    train_df.to_parquet(DATA_PATH / "train.parquet", index=False)
-    val_df.to_parquet(DATA_PATH / "val.parquet",   index=False)
+    pd.DataFrame(train_examples).to_parquet(DATA_PATH / "train.parquet", index=False)
+    pd.DataFrame(val_examples).to_parquet(DATA_PATH / "val.parquet",   index=False)
     data_volume.commit()
-    print(f"Saved {len(train_df)} train / {len(val_df)} val examples to volume")
 
 
 # ---------------------------------------------------------------------------
@@ -372,8 +386,8 @@ Rules:
 /nothink"""
 
 
-def _build_verl_examples(jsonl_data: str) -> list[dict]:
-    """Convert trajectory JSONL → verl parquet rows.
+def _build_verl_examples(trajectories: list[dict]) -> list[dict]:
+    """Convert trajectory dicts → verl parquet rows.
 
     verl expects each row to have:
       - data_source: str
@@ -383,11 +397,7 @@ def _build_verl_examples(jsonl_data: str) -> list[dict]:
       - extra_info: dict
     """
     examples = []
-    for line in jsonl_data.strip().split("\n"):
-        if not line.strip():
-            continue
-        traj = json.loads(line)
-
+    for traj in trajectories:
         sessions = traj.get("sessions", [])
         if not sessions:
             continue
