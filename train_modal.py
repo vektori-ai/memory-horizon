@@ -56,7 +56,7 @@ image = (
     .env({
         "HF_HOME": "/hf-cache",
         "TOKENIZERS_PARALLELISM": "false",
-        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512,garbage_collection_threshold:0.8",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,max_split_size_mb:512,garbage_collection_threshold:0.8",
     })
 )
 
@@ -141,7 +141,7 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS) -> dict:
         f"data.train_files={DATA_PATH / 'train.parquet'}",
         f"data.val_files={DATA_PATH / 'val.parquet'}",
         "data.train_batch_size=8",       # prompts per step; total rollouts = 8 × N_ROLLOUTS
-        "data.max_prompt_length=3072",
+        "data.max_prompt_length=2048",
         "data.max_response_length=512",
         "data.filter_overlong_prompts=True",
         "data.truncation=right",
@@ -165,7 +165,7 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS) -> dict:
         # rollout (SGLang — verl v0.5.0; vLLM 0.8.5 dropped)
         "actor_rollout_ref.rollout.name=sglang",
         "actor_rollout_ref.rollout.mode=async",
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.5",
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.3",
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2",
         f"actor_rollout_ref.rollout.n={N_ROLLOUTS}",
         # multi-turn AgentLoop
