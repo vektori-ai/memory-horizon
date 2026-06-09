@@ -20,8 +20,14 @@ env/
 .coverage
 htmlcov/
 
-# Data / runs
-data/
+# Data / runs — ignore generated data files, keep converter scripts
+data/*.jsonl
+data/*.json
+data/*.parquet
+data/*.zip
+data/*.txt
+data/synthetic_calls/
+data/calls-sanitized*/
 runs/
 
 # Editors
