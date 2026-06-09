@@ -170,10 +170,10 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS) -> dict:
         f"actor_rollout_ref.rollout.n={N_ROLLOUTS}",
         # multi-turn AgentLoop
         "+actor_rollout_ref.rollout.agent_loop_cls=agent_loop.MemoryAgentLoop",
-        "actor_rollout_ref.rollout.max_turns=20",
-        "actor_rollout_ref.rollout.single_response_max_tokens=256",
+        "+actor_rollout_ref.rollout.max_turns=20",
+        "+actor_rollout_ref.rollout.single_response_max_tokens=256",
         # raw chat format required for AgentLoop
-        "data.return_raw_chat=True",
+        "+data.return_raw_chat=True",
         # ref model
         "actor_rollout_ref.ref.fsdp_config.param_offload=True",
         "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2",
