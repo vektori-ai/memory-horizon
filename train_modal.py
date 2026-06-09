@@ -118,7 +118,7 @@ def compute_reward(
     """Vektori reward: R = 0.6 * token_F1 + 0.4 * ROUGE1_recall - volume_penalty.
 
     Format gate: invalid/unparseable op → -0.5 (penalised, not neutral).
-    ABSTAIN / DECAY with no content → 0.0 (model chose not to store; no signal).
+    ABSTAIN with no content → 0.0 (model chose not to store; no signal).
     """
     if not _is_valid_memory_op(solution_str):
         return -0.5
