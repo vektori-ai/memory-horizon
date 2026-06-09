@@ -48,7 +48,7 @@ image = (
     .apt_install("git")
     .run_commands(f"git clone https://github.com/volcengine/verl {VERL_REPO_PATH}")
     .uv_pip_install("verl[vllm]==0.4.1", "pandas", "pyarrow")
-    .add_local_file(Path(__file__).parent / "patch_verl.py", "/root/patch_verl.py")
+    .add_local_file(Path(__file__).parent / "patch_verl.py", "/root/patch_verl.py", copy=True)
     .run_commands("python /root/patch_verl.py")
     .env({
         "HF_HOME": "/hf-cache",
