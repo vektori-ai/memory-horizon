@@ -90,13 +90,6 @@ def prep(jsonl_data: str) -> None:
 
 # ---------------------------------------------------------------------------
 # Reward function  —  called by verl at training time
-# verl signature: compute_reward(data_source, solution_str, ground_truth, extra_info) -> float
-#
-# Two-tier reward:
-#   Tier 1 (weight 0.3): deterministic format/schema checks — JSON valid,
-#                        op in allowed set, key snake_case, content non-empty
-#                        and not a verbatim copy of the transcript.
-#   Tier 3 (weight 0.7): token F1 / keyword recall against the QA gold answer.
 # ---------------------------------------------------------------------------
 
 _VALID_OPS = {
