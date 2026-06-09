@@ -91,12 +91,8 @@ def prep(jsonl_data: str) -> None:
 # Reward function  —  called by verl at training time
 # ---------------------------------------------------------------------------
 
-_VALID_OPS = {
-    "STORE_FACT", "CREATE_EPISODE", "INFER_IMPLICIT",
-    "UPDATE", "SUPERSEDE", "DECAY", "KEEP_BOTH", "COMPRESS", "ABSTAIN",
-}
-# Ops that legitimately produce no content (model chose not to store anything).
-_CONTENT_OPTIONAL_OPS = {"ABSTAIN", "DECAY"}
+_VALID_OPS = {"STORE_FACT", "UPDATE", "SUPERSEDE", "COMPRESS", "ABSTAIN"}
+_CONTENT_OPTIONAL_OPS = {"ABSTAIN"}
 
 
 def compute_reward(
