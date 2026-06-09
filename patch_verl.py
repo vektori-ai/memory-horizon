@@ -16,7 +16,16 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-VERL_SITE = Path("/usr/local/lib/python3.10/dist-packages/verl")
+def _find_verl_site() -> Path:
+    import site
+    for d in site.getsitepackages():
+        p = Path(d) / "verl"
+        if p.exists():
+            return p
+    # Fallback: Python 3.10 path used in verl v0.4 images
+    return Path("/usr/local/lib/python3.10/dist-packages/verl")
+
+VERL_SITE = _find_verl_site()
 
 
 # ---------------------------------------------------------------------------
@@ -63,27 +72,37 @@ def patch_dp_actor() -> None:
 # ---------------------------------------------------------------------------
 
 _STEPWISE_IMPL = '''
-def _stepwise_broadcast(normalized_scores, eos_mask):
-    """Broadcast terminal advantage to all steps in each trajectory.
+def _stepwise_broadcast(scores, response_mask):
+    """Broadcast terminal advantage to all model-generated tokens in the trajectory.
 
     For single-step rollouts this is identical to standard GRPO.
-    For multi-step trajectories it propagates the terminal reward backward
-    so early memory operations (ADD/UPDATE/COMPRESS) get the same gradient
-    signal as the final QA answer turn.
+    For multi-step trajectories it propagates the terminal QA reward backward
+    so early memory op turns (STORE_FACT/UPDATE/COMPRESS) get the same gradient
+    signal as the final answer turn.
     """
-    batch, seq = eos_mask.shape
-    # normalized_scores: (batch,) — one scalar per trajectory (already group-normalised)
-    advantages = normalized_scores.unsqueeze(1).expand(batch, seq).contiguous()
-    return advantages * eos_mask
+    batch, seq = response_mask.shape
+    # scores: (batch,) — one scalar per trajectory (already group-normalised)
+    advantages = scores.unsqueeze(1).expand(batch, seq).contiguous()
+    return advantages * response_mask
 
 '''
 
 _OLD_EXPAND_VARIANTS = [
+    # Actual pattern in verl v0.4.1 and v0.5.0 core_algos.py
+    "scores = scores.unsqueeze(-1) * response_mask",
+    # Legacy variants kept as fallback for older/forked verl versions
     "advantages = normalized_scores.unsqueeze(-1).expand_as(eos_mask) * eos_mask",
     "advantages = normalized_scores.unsqueeze(1).expand_as(eos_mask) * eos_mask",
 ]
 
-_NEW_EXPAND = "advantages = _stepwise_broadcast(normalized_scores, eos_mask)"
+_NEW_EXPAND_MAP = {
+    "scores = scores.unsqueeze(-1) * response_mask":
+        "scores = _stepwise_broadcast(scores, response_mask)",
+    "advantages = normalized_scores.unsqueeze(-1).expand_as(eos_mask) * eos_mask":
+        "advantages = _stepwise_broadcast(normalized_scores, eos_mask)",
+    "advantages = normalized_scores.unsqueeze(1).expand_as(eos_mask) * eos_mask":
+        "advantages = _stepwise_broadcast(normalized_scores, eos_mask)",
+}
 
 
 def patch_grpo_stepwise() -> None:
@@ -94,20 +113,21 @@ def patch_grpo_stepwise() -> None:
         print("[patch] core_algos: step-wise GRPO already applied — skipping")
         return
 
-    old = None
+    matched_old = None
+    matched_new = None
     for variant in _OLD_EXPAND_VARIANTS:
         if variant in src:
-            old = variant
+            matched_old = variant
+            matched_new = _NEW_EXPAND_MAP[variant]
             break
 
-    if old is None:
-        print(
-            "[patch] core_algos: expand pattern not found — "
-            "skipping step-wise GRPO (check verl version; may already broadcast correctly)"
+    if matched_old is None:
+        raise RuntimeError(
+            f"[patch] core_algos: no expand pattern found in {path} — "
+            "check verl version. Known patterns: " + str(_OLD_EXPAND_VARIANTS)
         )
-        return
 
-    patched = _STEPWISE_IMPL + src.replace(old, _NEW_EXPAND, 1)
+    patched = _STEPWISE_IMPL + src.replace(matched_old, matched_new, 1)
     path.write_text(patched)
     print("[patch] core_algos: step-wise GRPO advantage broadcast applied ✓")
 

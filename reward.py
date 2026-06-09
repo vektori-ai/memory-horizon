@@ -12,7 +12,7 @@ import re
 import string
 from collections import Counter
 
-_VALID_OPS = {"STORE_FACT", "UPDATE", "SUPERSEDE", "COMPRESS", "ABSTAIN"}
+_VALID_OPS            = {"STORE_FACT", "UPDATE", "SUPERSEDE", "COMPRESS", "ABSTAIN"}
 _CONTENT_OPTIONAL_OPS = {"ABSTAIN"}
 
 _STOP = {"what", "is", "the", "are", "was", "were", "a", "an", "this", "that",
@@ -25,10 +25,14 @@ def compute_reward(
     ground_truth: str,
     extra_info: dict,
 ) -> float:
-    """R = 0.6 * token_F1 + 0.4 * ROUGE1_recall - volume_penalty.
+    """Per-step reward for Architecture A (one row per turn).
 
-    Format gate: invalid/unparseable op → -0.5 (penalised, not neutral).
-    ABSTAIN with no content → 0.0 (model chose not to store; no signal).
+    Format gate: invalid/unparseable op → -0.5.
+    Valid op with no content (ABSTAIN) → 0.0.
+    Valid op with content → 0.6 * token_F1 + 0.4 * ROUGE1_recall - volume_penalty + 0.1 format bonus.
+
+    The +0.1 format bonus on valid ops with content prevents the model from
+    collapsing to always ABSTAIN for near-zero reward.
     """
     if not _is_valid_memory_op(solution_str):
         return -0.5
@@ -41,7 +45,36 @@ def compute_reward(
     r_memory = _rouge1_recall(content, ground_truth)
     p_volume = min(0.002 * len(content.split()), 0.3)
 
-    return max(-1.0, min(1.0, 0.6 * r_task + 0.4 * r_memory - p_volume))
+    # +0.1 bonus for any valid op that stores content (anti-collapse pressure)
+    return max(-1.0, min(1.0, 0.6 * r_task + 0.4 * r_memory - p_volume + 0.1))
+
+
+def score_trajectory(fs_render: str, qa_probes_json: str) -> float:
+    """Terminal reward for Architecture B (multi-turn AgentLoop).
+
+    Args:
+        fs_render:      serialised VirtualFilesystem.render_for_prompt() output
+        qa_probes_json: JSON-serialised list of QAPair dicts
+
+    Returns average token-F1 of grepped FS content vs each answer.
+    Called once at episode end; step-wise GRPO broadcasts this to all prior turns.
+    """
+    try:
+        probes = json.loads(qa_probes_json) if isinstance(qa_probes_json, str) else qa_probes_json
+    except (json.JSONDecodeError, TypeError):
+        return 0.0
+
+    scores = []
+    for probe in probes:
+        answer = str(probe.get("answer", ""))
+        if not answer or answer in ("ABSTAIN", "Yes", "No", "N/A", ""):
+            continue
+
+        question = probe.get("question", "")
+        relevant = _grep_relevant(fs_render, question)
+        scores.append(_token_f1(relevant, answer))
+
+    return sum(scores) / len(scores) if scores else 0.0
 
 
 def _is_valid_memory_op(solution_str: str) -> bool:
@@ -59,8 +92,13 @@ def _is_valid_memory_op(solution_str: str) -> bool:
     if op not in _VALID_OPS:
         return False
 
-    if op not in _CONTENT_OPTIONAL_OPS and not d.get("content"):
-        return False
+    if op not in _CONTENT_OPTIONAL_OPS:
+        if not d.get("content"):
+            return False
+        # Non-ABSTAIN ops must have a path (category/entity format)
+        path = d.get("path", "")
+        if not path or "/" not in path:
+            return False
 
     return True
 
@@ -84,6 +122,15 @@ def _extract_content_field(completion: str) -> str:
     if m:
         return m.group(1)
     return ""
+
+
+def _grep_relevant(fs_text: str, question: str) -> str:
+    q_tokens = set(_normalize(question))
+    if not q_tokens or not fs_text.strip():
+        return fs_text
+    lines    = fs_text.split("\n")
+    relevant = [l for l in lines if any(t in l.lower() for t in q_tokens)]
+    return " ".join(relevant) if relevant else fs_text
 
 
 def _rouge1_recall(hypothesis: str, reference: str) -> float:

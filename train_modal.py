@@ -1,15 +1,15 @@
-"""GRPO memory training on Modal — Qwen3-8B with verl + vLLM.
+"""GRPO memory training on Modal — Qwen3-8B with verl + SGLang (v0.5.0).
 
 Run locally:
     modal run train_modal.py            # prep data + train
     modal run train_modal.py::prep      # data prep only
     modal run train_modal.py::train     # train only (after data is ready)
+    modal run train_modal.py::sanity    # 20-step smoke test
 """
 
 from __future__ import annotations
 
 import json
-import re
 import subprocess
 from pathlib import Path
 
@@ -44,12 +44,14 @@ REWARD_FUNCTION_NAME    = "compute_reward"
 # ---------------------------------------------------------------------------
 
 image = (
-    modal.Image.from_registry("verlai/verl:app-verl0.4-vllm0.8.5-mcore0.12.1")
+    modal.Image.from_registry("verlai/verl:app-verl0.5-sglang0.4.8-mcore0.12.2-te2.2")
     .apt_install("git")
     .run_commands(f"git clone https://github.com/volcengine/verl {VERL_REPO_PATH}")
-    .uv_pip_install("verl[vllm]==0.4.1", "pandas", "pyarrow")
-    .add_local_file(Path(__file__).parent / "patch_verl.py", "/root/patch_verl.py", copy=True)
-    .add_local_file(Path(__file__).parent / "reward.py",     "/root/reward.py",     copy=True)
+    .uv_pip_install("verl[sglang]==0.5.0", "pandas", "pyarrow")
+    .add_local_file(Path(__file__).parent / "patch_verl.py",  "/root/patch_verl.py",  copy=True)
+    .add_local_file(Path(__file__).parent / "reward.py",      "/root/reward.py",      copy=True)
+    .add_local_file(Path(__file__).parent / "memory_fs.py",   "/root/memory_fs.py",   copy=True)
+    .add_local_file(Path(__file__).parent / "agent_loop.py",  "/root/agent_loop.py",  copy=True)
     .run_commands("python /root/patch_verl.py")
     .env({
         "HF_HOME": "/hf-cache",
@@ -75,6 +77,9 @@ hf_cache_vol       = modal.Volume.from_name("hf-model-cache",          create_if
 def prep(jsonl_data: str, test_jsonls: dict[str, str] | None = None) -> None:
     import pandas as pd
     import random
+    import sys
+    sys.path.insert(0, "/root")
+    from agent_loop import build_verl_batch
 
     trajectories = [
         json.loads(line) for line in jsonl_data.strip().split("\n") if line.strip()
@@ -87,15 +92,13 @@ def prep(jsonl_data: str, test_jsonls: dict[str, str] | None = None) -> None:
     cut = max(1, int(len(trajectories) * 0.9))
     train_trajs, val_trajs = trajectories[:cut], trajectories[cut:]
 
-    # Edge case: if only one trajectory (e.g. LoCoMo-only run), keep it all in
-    # train and mirror it as val — better than an empty val set.
     if not val_trajs:
         val_trajs = train_trajs
 
-    train_examples = _build_verl_examples(train_trajs)
-    val_examples   = _build_verl_examples(val_trajs)
+    train_examples = build_verl_batch(train_trajs)
+    val_examples   = build_verl_batch(val_trajs)
     print(f"Trajectories — train: {len(train_trajs)}, val: {len(val_trajs)}")
-    print(f"Examples     — train: {len(train_examples)}, val: {len(val_examples)}")
+    print(f"Episode windows — train: {len(train_examples)}, val: {len(val_examples)}")
 
     DATA_PATH.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(train_examples).to_parquet(DATA_PATH / "train.parquet", index=False)
@@ -159,16 +162,18 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS) -> dict:
         "actor_rollout_ref.actor.entropy_coeff=0",
         "actor_rollout_ref.actor.fsdp_config.param_offload=True",
         "actor_rollout_ref.actor.fsdp_config.optimizer_offload=True",
-        # rollout (vLLM)
-        "actor_rollout_ref.rollout.name=vllm",
-        "actor_rollout_ref.rollout.tensor_model_parallel_size=2",
+        # rollout (SGLang — verl v0.5.0; vLLM 0.8.5 dropped)
+        "actor_rollout_ref.rollout.name=sglang",
+        "actor_rollout_ref.rollout.mode=async",
         "actor_rollout_ref.rollout.gpu_memory_utilization=0.5",
-        "actor_rollout_ref.rollout.enforce_eager=True",
-        "actor_rollout_ref.rollout.free_cache_engine=True",
-        "actor_rollout_ref.rollout.load_format=safetensors",
-        "actor_rollout_ref.rollout.layered_summon=True",
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2",
         f"actor_rollout_ref.rollout.n={N_ROLLOUTS}",
+        # multi-turn AgentLoop
+        "actor_rollout_ref.rollout.agent_loop_cls=agent_loop.MemoryAgentLoop",
+        "actor_rollout_ref.rollout.max_turns=20",
+        "actor_rollout_ref.rollout.single_response_max_tokens=256",
+        # raw chat format required for AgentLoop
+        "data.return_raw_chat=True",
         # ref model
         "actor_rollout_ref.ref.fsdp_config.param_offload=True",
         "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2",
@@ -206,20 +211,26 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS) -> dict:
     volumes={MODELS_PATH: checkpoints_volume, DATA_PATH: data_volume, "/hf-cache": hf_cache_vol},
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
-def eval(run_name: str = "locomo_lme_run_001", step: int = -1, n_examples: int = 0) -> dict:
+def eval(run_name: str = "locomo_lme_run_001", step: int = -1, n_trajectories: int = 0) -> dict:
     """Evaluate trained LoRA against LoCoMo + LongMemEval test sets.
 
-    Args:
-        run_name:   checkpoint directory under /models/
-        step:       specific global step to load; -1 = latest
-        n_examples: cap per dataset (0 = all)
+    Runs a real multi-turn eval: model processes turns one by one, builds a
+    VirtualFilesystem from its own ops, then QA probes are scored against the FS.
+    This matches the training setup exactly (no question hint, real FS accumulation).
 
-    Returns dict of per-dataset metrics: mean_reward, valid_op_rate, abstain_rate.
+    Args:
+        run_name:        checkpoint directory under /models/
+        step:            specific global step to load; -1 = latest
+        n_trajectories:  cap on trajectories per dataset (0 = all)
+
+    Returns dict of per-dataset metrics.
     """
     from transformers import AutoTokenizer, AutoModelForCausalLM
     from peft import PeftModel
-    import torch, glob
-    from reward import compute_reward
+    import torch, glob, sys
+    sys.path.insert(0, "/root")
+    from memory_fs import VirtualFilesystem, parse_op, score_trajectory
+    from agent_loop import _SYSTEM_PROMPT, _format_turn
 
     data_volume.reload()
 
@@ -238,7 +249,6 @@ def eval(run_name: str = "locomo_lme_run_001", step: int = -1, n_examples: int =
     model = PeftModel.from_pretrained(base, ckpt_dir)
     model.eval()
 
-    # ---- run eval per dataset ----
     all_results: dict[str, dict] = {}
 
     for dataset in ("locomo", "longmemeval"):
@@ -250,52 +260,74 @@ def eval(run_name: str = "locomo_lme_run_001", step: int = -1, n_examples: int =
         trajectories = [
             json.loads(line) for line in test_path.read_text().strip().split("\n") if line.strip()
         ]
-        examples = _build_verl_examples(trajectories)
-        if n_examples > 0:
-            examples = examples[:n_examples]
+        if n_trajectories > 0:
+            trajectories = trajectories[:n_trajectories]
 
-        print(f"\n[{dataset}] {len(examples)} examples")
+        print(f"\n[{dataset}] {len(trajectories)} trajectories")
 
-        rewards, abstains = [], 0
+        traj_rewards, abstain_counts, op_counts = [], [], []
 
-        for i, ex in enumerate(examples):
-            prompt       = ex["prompt"]
-            ground_truth = ex["reward_model"]["ground_truth"]
+        for traj in trajectories:
+            sessions    = traj.get("sessions", [])
+            qa_probes   = traj.get("qa_probes", [])
+            fs          = VirtualFilesystem()
+            traj_abstains = 0
+            traj_ops      = 0
 
-            ids = tokenizer.apply_chat_template(
-                prompt, return_tensors="pt", add_generation_prompt=True
-            ).to("cuda")
+            # Process every turn in order — model builds its own FS
+            for s_idx, session in enumerate(sessions):
+                for t_idx, turn in enumerate(session.get("turns", [])):
+                    content = turn.get("content", "").strip()
+                    if not content:
+                        continue
 
-            with torch.no_grad():
-                out = model.generate(ids, max_new_tokens=256, do_sample=False)
+                    messages = [
+                        {"role": "system", "content": _SYSTEM_PROMPT},
+                        {
+                            "role": "user",
+                            "content": (
+                                f"[Memory state]\n{fs.render_for_prompt()}\n\n"
+                                f"[Current turn]\n{_format_turn(turn)}"
+                            ),
+                        },
+                    ]
 
-            response = tokenizer.decode(out[0][ids.shape[1]:], skip_special_tokens=True)
-            reward   = compute_reward(dataset, response, ground_truth, {})
-            rewards.append(reward)
+                    ids = tokenizer.apply_chat_template(
+                        messages, return_tensors="pt", add_generation_prompt=True
+                    ).to("cuda")
 
-            if '"op": "ABSTAIN"' in response:
-                abstains += 1
+                    with torch.no_grad():
+                        out = model.generate(ids, max_new_tokens=256, do_sample=False)
 
-            if (i + 1) % 100 == 0:
-                print(f"  {i + 1}/{len(examples)} — running mean reward: {sum(rewards)/len(rewards):.3f}")
+                    response = tokenizer.decode(out[0][ids.shape[1]:], skip_special_tokens=True)
+                    op = parse_op(response)
+                    fs.apply_op(op, session_idx=s_idx, turn_idx=t_idx)
+                    traj_ops += 1
 
-        n = len(rewards)
-        mean_r     = sum(rewards) / n
-        valid_rate = sum(1 for r in rewards if r > -0.5) / n
-        abstain_rate = abstains / n
+                    if op.get("op") == "ABSTAIN" or not op:
+                        traj_abstains += 1
 
-        print(f"\n[{dataset}] RESULTS ({n} examples)")
-        print(f"  mean reward:   {mean_r:.3f}")
-        print(f"  valid op rate: {valid_rate:.1%}")
-        print(f"  abstain rate:  {abstain_rate:.1%}")
-        print(f"  reward ≥ 0.5:  {sum(1 for r in rewards if r >= 0.5)/n:.1%}")
-        print(f"  reward < 0:    {sum(1 for r in rewards if r < 0)/n:.1%}")
+            # Score final FS against all QA probes
+            traj_reward = score_trajectory(fs, qa_probes)
+            traj_rewards.append(traj_reward)
+            abstain_counts.append(traj_abstains / max(traj_ops, 1))
+            op_counts.append(traj_ops)
+
+        n          = len(traj_rewards)
+        mean_r     = sum(traj_rewards) / n
+        abstain_r  = sum(abstain_counts) / n
+
+        print(f"\n[{dataset}] RESULTS ({n} trajectories, avg {sum(op_counts)/n:.0f} turns/traj)")
+        print(f"  mean FS-QA F1:  {mean_r:.3f}")
+        print(f"  abstain rate:   {abstain_r:.1%}")
+        print(f"  F1 ≥ 0.5:       {sum(1 for r in traj_rewards if r >= 0.5)/n:.1%}")
+        print(f"  F1 < 0.1:       {sum(1 for r in traj_rewards if r < 0.1)/n:.1%}")
 
         all_results[dataset] = {
-            "n":            n,
-            "mean_reward":  round(mean_r, 4),
-            "valid_op_rate": round(valid_rate, 4),
-            "abstain_rate": round(abstain_rate, 4),
+            "n":              n,
+            "mean_fs_qa_f1":  round(mean_r, 4),
+            "abstain_rate":   round(abstain_r, 4),
+            "f1_ge_0.5":      round(sum(1 for r in traj_rewards if r >= 0.5) / n, 4),
         }
 
     return all_results
@@ -358,94 +390,5 @@ def main():
     print("Done:", result)
 
 
-# ---------------------------------------------------------------------------
-# Data helpers
-# ---------------------------------------------------------------------------
-
-_SYSTEM_PROMPT = """\
-You are a memory manager for a conversational AI agent. \
-Given a conversation, extract and store the key facts that would help answer questions later.
-
-Output a single JSON object:
-{"op": "<STORE_FACT|UPDATE|SUPERSEDE|COMPRESS|ABSTAIN>", "content": "<what to remember>", "key": "<snake_case_key>", "confidence": <0.0-1.0>}
-
-Rules:
-- STORE_FACT: new fact not yet in memory
-- UPDATE: a fact you already stored has changed
-- SUPERSEDE: old fact was wrong, replace it permanently
-- COMPRESS: summarise a long memory entry into a shorter one
-- ABSTAIN: no storable information in this conversation
-- Keep content concise — one sentence max
-- key must be lowercase snake_case (e.g. user_name, last_location, job_title)
-/nothink"""
-
-
-def _build_verl_examples(trajectories: list[dict]) -> list[dict]:
-    """Convert trajectory dicts → verl parquet rows.
-
-    verl expects each row to have:
-      - data_source: str
-      - prompt: list of message dicts (chat format)
-      - ability: str
-      - reward_model: dict with 'ground_truth' key
-      - extra_info: dict
-    """
-    examples = []
-    for traj in trajectories:
-        sessions = traj.get("sessions", [])
-        if not sessions:
-            continue
-
-        # Use ALL sessions — not just the first one.
-        # For long conversations (LoCoMo has 19-35 sessions) we concatenate
-        # all turns so the model sees the full context when deciding what to store.
-        all_turns = [t for s in sessions for t in s.get("turns", [])]
-        conv_text = _format_conversation(all_turns)
-
-        # Truncate if too long for context window (keep last N tokens worth)
-        MAX_CONV_CHARS = 8_000
-        if len(conv_text) > MAX_CONV_CHARS:
-            conv_text = conv_text[-MAX_CONV_CHARS:]
-
-        data_source = traj.get("vertical", "locomo")
-
-        for probe in traj.get("qa_probes", []):
-            question = probe.get("question", "")
-            answer   = str(probe.get("answer", ""))
-            if not question or not answer or answer in ("ABSTAIN", "Yes", "No", ""):
-                continue
-
-            prompt = [
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": (
-                        f"Conversation transcript:\n{conv_text}\n\n"
-                        f"The following question will be asked from memory later:\n"
-                        f"Q: {question}\n\n"
-                        f"Store the relevant information now:"
-                    ),
-                },
-            ]
-
-            examples.append({
-                "data_source":  data_source,
-                "prompt":       prompt,
-                "ability":      "memory_extraction",
-                "reward_model": {"ground_truth": answer},
-                "extra_info":   {"question": question},
-            })
-
-    return examples
-
-
-def _format_conversation(turns: list[dict]) -> str:
-    lines = []
-    for t in turns:
-        role    = "Agent" if t.get("role") == "assistant" else "Customer"
-        content = t.get("content", "").strip()
-        if content:
-            lines.append(f"{role}: {content}")
-    return "\n".join(lines)
 
 
