@@ -1,11 +1,8 @@
-"""Verifier suite for memory_horizon environments.
+"""Verifiers for memory_horizon environments.
 
-Three tiers:
     Tier 1 — deterministic, zero LLM cost (tier1_deterministic.py)
-    Tier 2 — GPT-4o judge, used ONLY for Base 5 (Abstain) (tier2_llm_judge.py)
-    Tier 3 — outcome-based: frozen QA model, token F1, Kendall's tau (tier3_outcome.py)
-
-Plus a standalone hallucination detector (hallucination.py).
+    Tier 3 — outcome-based: token F1, Kendall's tau, QA recall (tier3_outcome.py)
+    hallucination.py — entity/numeric grounding check against oracle memory
 """
 
 from memory_horizon.verifiers.tier1_deterministic import Tier1Verifier, Tier1Result

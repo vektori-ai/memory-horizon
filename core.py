@@ -152,10 +152,6 @@ class EnvSpec:
         kwargs = {**self.kwargs, **override_kwargs}
         env = cls(**kwargs)
         env.spec = self
-        if self.max_episode_steps is not None:
-            from memory_horizon.wrappers.time_limit import TimeLimit
-
-            env = TimeLimit(env, max_episode_steps=self.max_episode_steps)
         return env
 
     def __repr__(self) -> str:
