@@ -19,8 +19,12 @@ import modal
 # Config
 # ---------------------------------------------------------------------------
 
-REPO_ROOT = Path(__file__).parent
-DATA_PATH_LOCAL = REPO_ROOT / "data" / "train.jsonl"
+REPO_ROOT            = Path(__file__).parent
+DATA_PATH_LOCAL      = REPO_ROOT / "data" / "train.jsonl"
+TEST_PATHS_LOCAL     = {
+    "locomo":       REPO_ROOT / "data" / "locomo_test.jsonl",
+    "longmemeval":  REPO_ROOT / "data" / "longmemeval_test.jsonl",
+}
 
 MODEL_ID    = "Qwen/Qwen3-8B"
 N_ROLLOUTS  = 4      # completions per prompt (GRPO group size)
@@ -68,7 +72,7 @@ hf_cache_vol       = modal.Volume.from_name("hf-model-cache",          create_if
     image=image,
     volumes={DATA_PATH: data_volume, "/hf-cache": hf_cache_vol},
 )
-def prep(jsonl_data: str) -> None:
+def prep(jsonl_data: str, test_jsonls: dict[str, str] | None = None) -> None:
     import pandas as pd
     import random
 
@@ -96,6 +100,14 @@ def prep(jsonl_data: str) -> None:
     DATA_PATH.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(train_examples).to_parquet(DATA_PATH / "train.parquet", index=False)
     pd.DataFrame(val_examples).to_parquet(DATA_PATH / "val.parquet",   index=False)
+
+    # Store test JSONL files so eval() can load them from the volume.
+    for name, content in (test_jsonls or {}).items():
+        dest = DATA_PATH / f"{name}_test.jsonl"
+        dest.write_text(content)
+        n = content.count("\n")
+        print(f"Stored test data: {name} ({n} trajectories) → {dest}")
+
     data_volume.commit()
 
 
@@ -190,16 +202,28 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS) -> dict:
 @app.function(
     image=image,
     gpu="A100-80GB:1",
-    timeout=10 * MINUTES,
-    volumes={MODELS_PATH: checkpoints_volume, "/hf-cache": hf_cache_vol},
+    timeout=90 * MINUTES,
+    volumes={MODELS_PATH: checkpoints_volume, DATA_PATH: data_volume, "/hf-cache": hf_cache_vol},
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
-def eval(run_name: str = "locomo_lme_run_001", step: int = -1):
+def eval(run_name: str = "locomo_lme_run_001", step: int = -1, n_examples: int = 0) -> dict:
+    """Evaluate trained LoRA against LoCoMo + LongMemEval test sets.
+
+    Args:
+        run_name:   checkpoint directory under /models/
+        step:       specific global step to load; -1 = latest
+        n_examples: cap per dataset (0 = all)
+
+    Returns dict of per-dataset metrics: mean_reward, valid_op_rate, abstain_rate.
+    """
     from transformers import AutoTokenizer, AutoModelForCausalLM
     from peft import PeftModel
-    import torch, glob, os
+    import torch, glob
+    from reward import compute_reward
 
-    # find latest checkpoint if step == -1
+    data_volume.reload()
+
+    # ---- load checkpoint ----
     ckpt_root = MODELS_PATH / run_name
     if step == -1:
         dirs = sorted(glob.glob(str(ckpt_root / "global_step_*")))
@@ -207,43 +231,74 @@ def eval(run_name: str = "locomo_lme_run_001", step: int = -1):
         ckpt_dir = dirs[-1]
     else:
         ckpt_dir = str(ckpt_root / f"global_step_{step}")
-    print(f"Loading checkpoint: {ckpt_dir}")
+    print(f"Checkpoint: {ckpt_dir}")
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    base = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16, device_map="auto")
+    base  = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16, device_map="auto")
     model = PeftModel.from_pretrained(base, ckpt_dir)
     model.eval()
 
-    test_turns = [
-        ("Agent: Hello, calling about your DemoLender loan. Outstanding is 47,000 rupees. Settlement offer: 32,900.\n"
-         "Customer: I already paid that loan off months ago.",
-         "Customer disputes the outstanding balance, claims loan was already paid"),
-        ("Agent: Can we schedule a callback?\nCustomer: Call me next Tuesday after 6pm.",
-         "Customer requested callback on Tuesday after 6pm"),
-        ("Agent: What's your current address?\nCustomer: I'm at 42 Park Street, Mumbai.",
-         "Customer's address is 42 Park Street, Mumbai"),
-    ]
+    # ---- run eval per dataset ----
+    all_results: dict[str, dict] = {}
 
-    system = (
-        "You are a memory manager for an AI calling agent. Extract key facts as JSON:\n"
-        '{"op": "<STORE_FACT|UPDATE|SUPERSEDE|ABSTAIN>", "content": "<what to remember>", '
-        '"key": "<snake_case_key>", "confidence": <0.0-1.0>}'
-    )
+    for dataset in ("locomo", "longmemeval"):
+        test_path = DATA_PATH / f"{dataset}_test.jsonl"
+        if not test_path.exists():
+            print(f"[{dataset}] no test file at {test_path} — skipping")
+            continue
 
-    for transcript, expected in test_turns:
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": f"Conversation transcript:\n{transcript}\n\nStore the relevant information now:"},
+        trajectories = [
+            json.loads(line) for line in test_path.read_text().strip().split("\n") if line.strip()
         ]
-        ids = tokenizer.apply_chat_template(messages, return_tensors="pt", add_generation_prompt=True).to("cuda")
-        with torch.no_grad():
-            out = model.generate(ids, max_new_tokens=256, temperature=0.1, do_sample=True)
-        response = tokenizer.decode(out[0][ids.shape[1]:], skip_special_tokens=True)
-        response = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
-        print(f"\nTranscript: {transcript[:80]}...")
-        print(f"Expected:   {expected}")
-        print(f"Model:      {response}")
-        print("-" * 60)
+        examples = _build_verl_examples(trajectories)
+        if n_examples > 0:
+            examples = examples[:n_examples]
+
+        print(f"\n[{dataset}] {len(examples)} examples")
+
+        rewards, abstains = [], 0
+
+        for i, ex in enumerate(examples):
+            prompt       = ex["prompt"]
+            ground_truth = ex["reward_model"]["ground_truth"]
+
+            ids = tokenizer.apply_chat_template(
+                prompt, return_tensors="pt", add_generation_prompt=True
+            ).to("cuda")
+
+            with torch.no_grad():
+                out = model.generate(ids, max_new_tokens=256, do_sample=False)
+
+            response = tokenizer.decode(out[0][ids.shape[1]:], skip_special_tokens=True)
+            reward   = compute_reward(dataset, response, ground_truth, {})
+            rewards.append(reward)
+
+            if '"op": "ABSTAIN"' in response:
+                abstains += 1
+
+            if (i + 1) % 100 == 0:
+                print(f"  {i + 1}/{len(examples)} — running mean reward: {sum(rewards)/len(rewards):.3f}")
+
+        n = len(rewards)
+        mean_r     = sum(rewards) / n
+        valid_rate = sum(1 for r in rewards if r > -0.5) / n
+        abstain_rate = abstains / n
+
+        print(f"\n[{dataset}] RESULTS ({n} examples)")
+        print(f"  mean reward:   {mean_r:.3f}")
+        print(f"  valid op rate: {valid_rate:.1%}")
+        print(f"  abstain rate:  {abstain_rate:.1%}")
+        print(f"  reward ≥ 0.5:  {sum(1 for r in rewards if r >= 0.5)/n:.1%}")
+        print(f"  reward < 0:    {sum(1 for r in rewards if r < 0)/n:.1%}")
+
+        all_results[dataset] = {
+            "n":            n,
+            "mean_reward":  round(mean_r, 4),
+            "valid_op_rate": round(valid_rate, 4),
+            "abstain_rate": round(abstain_rate, 4),
+        }
+
+    return all_results
 
 
 # ---------------------------------------------------------------------------
@@ -257,9 +312,10 @@ def prep_data():
         print(f"Data not found at {DATA_PATH_LOCAL}")
         print("Run: python3 data/converters/locomo_converter.py && python3 data/converters/longmemeval_converter.py")
         return
-    jsonl_data = DATA_PATH_LOCAL.read_text()
-    print(f"Loaded {jsonl_data.count(chr(10))} trajectories — rebuilding parquet...")
-    prep.remote(jsonl_data=jsonl_data)
+    jsonl_data  = DATA_PATH_LOCAL.read_text()
+    test_jsonls = {k: p.read_text() for k, p in TEST_PATHS_LOCAL.items() if p.exists()}
+    print(f"Loaded {jsonl_data.count(chr(10))} train trajectories, {len(test_jsonls)} test sets")
+    prep.remote(jsonl_data=jsonl_data, test_jsonls=test_jsonls)
     print("Done. Run 'modal run train_modal.py::train_only' to start training.")
 
 
@@ -267,11 +323,12 @@ def prep_data():
 def sanity():
     """Sanity run — 20 steps on existing parquet. Confirms the full pipeline works (~$7).
 
-    Run: python3.10 -m modal run train_modal.py::sanity
+    Run: modal run train_modal.py::sanity
     """
     print("Starting sanity run (20 steps)...")
-    jsonl_data = DATA_PATH_LOCAL.read_text()
-    prep.remote(jsonl_data=jsonl_data)
+    jsonl_data  = DATA_PATH_LOCAL.read_text()
+    test_jsonls = {k: p.read_text() for k, p in TEST_PATHS_LOCAL.items() if p.exists()}
+    prep.remote(jsonl_data=jsonl_data, test_jsonls=test_jsonls)
     result = train.remote(run_name="sanity_001", n_steps=20)
     print("Sanity run done:", result)
 
@@ -291,10 +348,10 @@ def main():
         print("Run: python3 data/converters/locomo_converter.py && python3 data/converters/longmemeval_converter.py")
         return
 
-    jsonl_data = DATA_PATH_LOCAL.read_text()
-    n_lines = jsonl_data.count("\n")
-    print(f"Loaded {n_lines} trajectories — uploading and preparing dataset...")
-    prep.remote(jsonl_data=jsonl_data)
+    jsonl_data  = DATA_PATH_LOCAL.read_text()
+    test_jsonls = {k: p.read_text() for k, p in TEST_PATHS_LOCAL.items() if p.exists()}
+    print(f"Loaded {jsonl_data.count(chr(10))} train trajectories, {len(test_jsonls)} test sets")
+    prep.remote(jsonl_data=jsonl_data, test_jsonls=test_jsonls)
 
     print("Starting GRPO training with verl + vLLM...")
     result = train.remote(run_name="locomo_lme_run_001")
