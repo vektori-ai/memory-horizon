@@ -56,7 +56,7 @@ image = (
     .env({
         "HF_HOME": "/hf-cache",
         "TOKENIZERS_PARALLELISM": "false",
-        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512,garbage_collection_threshold:0.8",
+        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512,garbage_collection_threshold:0.8,expandable_segments:True",
         "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "True",
     })
 )
@@ -142,7 +142,7 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS) -> dict:
         f"data.train_files={DATA_PATH / 'train.parquet'}",
         f"data.val_files={DATA_PATH / 'val.parquet'}",
         "data.train_batch_size=8",       # prompts per step; total rollouts = 8 × N_ROLLOUTS
-        "data.max_prompt_length=2560",
+        "data.max_prompt_length=2048",
         "data.max_response_length=256",
         "data.filter_overlong_prompts=True",
         "data.truncation=right",
@@ -169,9 +169,10 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS) -> dict:
         # headroom for FSDP allgathers (model=8GB + KV=8GB per GPU at 0.2×80GB=16GB)
         "actor_rollout_ref.rollout.name=sglang",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=2",
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.25",
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.2",
         "actor_rollout_ref.rollout.free_cache_engine=True",
         "actor_rollout_ref.rollout.enforce_eager=True",
+        "actor_rollout_ref.rollout.max_model_len=8192",   # cap total context per sequence; prevents OOM on long multi-turn episodes
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2",
         f"actor_rollout_ref.rollout.n={N_ROLLOUTS}",
         # multi-turn AgentLoop
