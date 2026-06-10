@@ -172,7 +172,6 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS) -> dict:
         "actor_rollout_ref.rollout.gpu_memory_utilization=0.2",
         "actor_rollout_ref.rollout.free_cache_engine=True",
         "actor_rollout_ref.rollout.enforce_eager=True",
-        "actor_rollout_ref.rollout.max_model_len=8192",   # cap total context per sequence; prevents OOM on long multi-turn episodes
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2",
         f"actor_rollout_ref.rollout.n={N_ROLLOUTS}",
         # multi-turn AgentLoop
