@@ -141,7 +141,7 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS) -> dict:
         # data
         f"data.train_files={DATA_PATH / 'train.parquet'}",
         f"data.val_files={DATA_PATH / 'val.parquet'}",
-        "data.train_batch_size=16",      # prompts per step; total rollouts = 16 × N_ROLLOUTS
+        "data.train_batch_size=8",       # prompts per step; total rollouts = 8 × N_ROLLOUTS
         "data.max_prompt_length=2560",
         "data.max_response_length=256",
         "data.filter_overlong_prompts=True",
@@ -155,7 +155,7 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS) -> dict:
         "actor_rollout_ref.model.target_modules=all-linear",
         # actor
         f"actor_rollout_ref.actor.optim.lr=1e-4",
-        "actor_rollout_ref.actor.ppo_mini_batch_size=16",
+        "actor_rollout_ref.actor.ppo_mini_batch_size=8",
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2",
         "actor_rollout_ref.actor.use_kl_loss=True",
         "actor_rollout_ref.actor.kl_loss_coef=0.001",
@@ -169,7 +169,7 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS) -> dict:
         # headroom for FSDP allgathers (model=8GB + KV=8GB per GPU at 0.2×80GB=16GB)
         "actor_rollout_ref.rollout.name=sglang",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=2",
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.3",
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.2",
         "actor_rollout_ref.rollout.free_cache_engine=True",
         "actor_rollout_ref.rollout.enforce_eager=True",
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2",
