@@ -56,7 +56,7 @@ image = (
     .env({
         "HF_HOME": "/hf-cache",
         "TOKENIZERS_PARALLELISM": "false",
-        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512,garbage_collection_threshold:0.8,expandable_segments:True",
+        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512,garbage_collection_threshold:0.8",
         "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "True",
     })
 )
