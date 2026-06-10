@@ -289,8 +289,14 @@ class MemoryAgentLoop:
             if step_idx < len(rest_turns):
                 next_turn = rest_turns[step_idx]
 
+                # Truncate FS to last 30 lines to bound context growth during multi-turn episodes
+                fs_text  = fs.render_for_prompt()
+                fs_lines = fs_text.split("\n")
+                if len(fs_lines) > 30:
+                    fs_text = "\n".join(fs_lines[-30:]) + "\n[...truncated]"
+
                 observation = (
-                    f"\n[Memory state]\n{fs.render_for_prompt()}\n\n"
+                    f"\n[Memory state]\n{fs_text}\n\n"
                     f"[Next turn]\n{_format_turn(next_turn)}"
                 )
                 obs_ids = self.tokenize_text(observation)

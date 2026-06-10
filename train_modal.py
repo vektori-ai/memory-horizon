@@ -169,7 +169,7 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS) -> dict:
         # headroom for FSDP allgathers (model=8GB + KV=8GB per GPU at 0.2×80GB=16GB)
         "actor_rollout_ref.rollout.name=sglang",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=2",
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.2",
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.3",   # 0.2 OOMs with dense probe windows; 0.3 = 24GB budget vs 8GB model
         "actor_rollout_ref.rollout.free_cache_engine=True",
         "actor_rollout_ref.rollout.enforce_eager=True",
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2",
@@ -365,11 +365,13 @@ def sanity():
 
     Run: modal run train_modal.py::sanity
     """
-    print("Starting sanity run (20 steps)...")
+    import time
+    run_name = f"sanity_{int(time.time())}"   # unique name prevents resume from old checkpoint
+    print(f"Starting sanity run (20 steps, name={run_name})...")
     jsonl_data  = DATA_PATH_LOCAL.read_text()
     test_jsonls = {k: p.read_text() for k, p in TEST_PATHS_LOCAL.items() if p.exists()}
     prep.remote(jsonl_data=jsonl_data, test_jsonls=test_jsonls)
-    result = train.remote(run_name="sanity_001", n_steps=20)
+    result = train.remote(run_name=run_name, n_steps=20)
     print("Sanity run done:", result)
 
 
