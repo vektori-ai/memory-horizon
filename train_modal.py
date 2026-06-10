@@ -56,7 +56,8 @@ image = (
     .env({
         "HF_HOME": "/hf-cache",
         "TOKENIZERS_PARALLELISM": "false",
-        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,max_split_size_mb:512,garbage_collection_threshold:0.8",
+        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512,garbage_collection_threshold:0.8",
+        "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "True",
     })
 )
 
@@ -140,9 +141,9 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS) -> dict:
         # data
         f"data.train_files={DATA_PATH / 'train.parquet'}",
         f"data.val_files={DATA_PATH / 'val.parquet'}",
-        "data.train_batch_size=4",       # prompts per step; total rollouts = 4 × N_ROLLOUTS
+        "data.train_batch_size=8",       # prompts per step; total rollouts = 8 × N_ROLLOUTS
         "data.max_prompt_length=2048",
-        "data.max_response_length=512",
+        "data.max_response_length=256",
         "data.filter_overlong_prompts=True",
         "data.truncation=right",
         # model + LoRA (cuts optimizer states from 32 GB → ~320 MB)
@@ -154,20 +155,24 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS) -> dict:
         "actor_rollout_ref.model.target_modules=all-linear",
         # actor
         f"actor_rollout_ref.actor.optim.lr=1e-4",
-        "actor_rollout_ref.actor.ppo_mini_batch_size=4",
-        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1",
+        "actor_rollout_ref.actor.ppo_mini_batch_size=8",
+        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2",
         "actor_rollout_ref.actor.use_kl_loss=True",
         "actor_rollout_ref.actor.kl_loss_coef=0.001",
         "actor_rollout_ref.actor.kl_loss_type=low_var_kl",
         "actor_rollout_ref.actor.entropy_coeff=0",
         "actor_rollout_ref.actor.fsdp_config.param_offload=True",
         "actor_rollout_ref.actor.fsdp_config.optimizer_offload=True",
-        # rollout (SGLang — verl v0.5.0; vLLM 0.8.5 dropped)
+        # rollout (SGLang — verl v0.5.0)
+        # TP=2 splits model across both GPUs; free_cache_engine offloads KV between phases;
+        # enforce_eager required with free_cache_engine; gpu_memory_utilization=0.2 leaves
+        # headroom for FSDP allgathers (model=8GB + KV=8GB per GPU at 0.2×80GB=16GB)
         "actor_rollout_ref.rollout.name=sglang",
-        "actor_rollout_ref.rollout.mode=async",
-        "actor_rollout_ref.rollout.tensor_model_parallel_size=2",  # split model across both GPUs
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.25",
-        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1",
+        "actor_rollout_ref.rollout.tensor_model_parallel_size=2",
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.2",
+        "actor_rollout_ref.rollout.free_cache_engine=True",
+        "actor_rollout_ref.rollout.enforce_eager=True",
+        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2",
         f"actor_rollout_ref.rollout.n={N_ROLLOUTS}",
         # multi-turn AgentLoop
         "+actor_rollout_ref.rollout.agent_loop_cls=agent_loop.MemoryAgentLoop",
@@ -178,14 +183,16 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS) -> dict:
         # ref model
         "actor_rollout_ref.ref.fsdp_config.param_offload=True",
         "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2",
-        # trainer
+        # trainer — val_before_train=False skips the initial _validate() that OOMs on
+        # first SGLang wake_up (KV cache alloc) before FSDP has freed its GPU memory
         "trainer.critic_warmup=0",
+        "trainer.val_before_train=False",
         "trainer.logger=['console','wandb']",
         "trainer.project_name=memory-rlvr",
         f"trainer.experiment_name={run_name}",
         "trainer.n_gpus_per_node=2",
         "trainer.nnodes=1",
-        f"trainer.test_freq={min(10, n_steps)}",
+        f"trainer.test_freq={n_steps + 1}",  # skip validation for now; SGLang KV alloc OOMs alongside FSDP
         f"trainer.save_freq={min(25, n_steps)}",
         f"trainer.total_training_steps={n_steps}",
         f"trainer.default_local_dir={MODELS_PATH / run_name}",
