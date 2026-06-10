@@ -169,7 +169,7 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS) -> dict:
         # headroom for FSDP allgathers (model=8GB + KV=8GB per GPU at 0.2×80GB=16GB)
         "actor_rollout_ref.rollout.name=sglang",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=2",
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.5",   # SGLang warms up at 160 concurrent seqs × 2048 context = 23.6GB KV; need ≥31.88GB; 0.5×80=40GB gives 31.72GB pool
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.45",  # warmup: 160 seqs×2048 ctx=23.6GB KV needs ≥31.88GB total; 0.45×79.25=35.66-4.14=31.52GB KV; wake_up state_dict needs ~4GB free; 0.45 leaves ~4.5GB
         "actor_rollout_ref.rollout.free_cache_engine=True",
         "actor_rollout_ref.rollout.enforce_eager=True",
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2",
