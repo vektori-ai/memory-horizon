@@ -39,13 +39,26 @@ def compute_reward(
     if not content:
         return 0.0
 
-    r_task   = _token_f1(content, ground_truth)
-    r_memory = _rouge1_recall(content, ground_truth)
+    # ground_truth is json.dumps(qa_probes) — extract answer strings only so
+    # _token_f1 compares stored content against actual answers, not JSON metadata
+    answer_ref = _extract_answers(ground_truth)
+
+    r_task   = _token_f1(content, answer_ref)
+    r_memory = _rouge1_recall(content, answer_ref)
     p_volume = min(0.002 * len(content.split()), 0.3)
 
     # +0.1 bonus for any valid op that stores content (anti-collapse pressure)
     return max(-1.0, min(1.0, 0.6 * r_task + 0.4 * r_memory - p_volume + 0.1))
 
+
+
+def _extract_answers(ground_truth: str) -> str:
+    """Pull answer strings out of json.dumps(qa_probes) for clean token-F1."""
+    try:
+        probes = json.loads(ground_truth)
+        return " ".join(str(p.get("answer", "")) for p in probes if p.get("answer"))
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return ground_truth
 
 
 def _is_valid_memory_op(solution_str: str) -> bool:

@@ -142,7 +142,7 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS) -> dict:
         f"data.train_files={DATA_PATH / 'train.parquet'}",
         f"data.val_files={DATA_PATH / 'val.parquet'}",
         "data.train_batch_size=8",       # prompts per step; total rollouts = 8 × N_ROLLOUTS
-        "data.max_prompt_length=2048",
+        "data.max_prompt_length=2560",
         "data.max_response_length=256",
         "data.filter_overlong_prompts=True",
         "data.truncation=right",
