@@ -37,8 +37,8 @@ if TYPE_CHECKING:
 # Constants
 # ---------------------------------------------------------------------------
 
-EPISODE_WINDOW  = 20   # turns per episode
-EPISODE_STRIDE  = 10   # stride between windows (overlap = WINDOW - STRIDE)
+EPISODE_WINDOW  = 10   # turns per episode (20 OOMs at 32 concurrent seqs; 10 keeps KV ~9-12K tokens)
+EPISODE_STRIDE  = 5    # stride between windows (overlap = WINDOW - STRIDE)
 
 _SYSTEM_PROMPT = """\
 You are a memory manager for a long-running conversational AI.

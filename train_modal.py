@@ -27,7 +27,7 @@ TEST_PATHS_LOCAL     = {
 }
 
 MODEL_ID    = "Qwen/Qwen3-8B"
-N_ROLLOUTS  = 4      # completions per prompt (GRPO group size)
+N_ROLLOUTS  = 2      # completions per prompt (4 OOMs at 20-turn episodes; 2 halves KV pressure)
 N_STEPS     = 500
 
 DATA_PATH      = Path("/data")
@@ -169,14 +169,14 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS) -> dict:
         # headroom for FSDP allgathers (model=8GB + KV=8GB per GPU at 0.2×80GB=16GB)
         "actor_rollout_ref.rollout.name=sglang",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=2",
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.2",
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.25",
         "actor_rollout_ref.rollout.free_cache_engine=True",
         "actor_rollout_ref.rollout.enforce_eager=True",
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2",
         f"actor_rollout_ref.rollout.n={N_ROLLOUTS}",
         # multi-turn AgentLoop
         "+actor_rollout_ref.rollout.agent_loop_cls=agent_loop.MemoryAgentLoop",
-        "+actor_rollout_ref.rollout.max_turns=20",
+        "+actor_rollout_ref.rollout.max_turns=10",
         "+actor_rollout_ref.rollout.single_response_max_tokens=256",
         # raw chat format required for AgentLoop
         "data.return_raw_chat=True",
