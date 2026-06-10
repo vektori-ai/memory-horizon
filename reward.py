@@ -3,18 +3,31 @@
 verl config:
     custom_reward_function.path=/root/reward.py
     custom_reward_function.name=compute_reward
+
+Role: per-step FORMAT gate only.
+  invalid JSON / missing op   → -0.5
+  valid ABSTAIN               →  0.0
+  valid op with content       → +0.1
+
+Quality signal (did the stored content answer the QA probes?) comes entirely
+from MemoryAgentLoop.run() → score_trajectory → AgentLoopOutput.reward.
+Keeping these two signals separate avoids double-counting and makes each
+one interpretable on its own in WandB.
 """
 
 from __future__ import annotations
 
 import json
 import re
+import string
 from collections import Counter
 
 from memory_fs import _token_f1, _normalize
 
 _VALID_OPS            = {"STORE_FACT", "UPDATE", "SUPERSEDE", "COMPRESS", "ABSTAIN"}
 _CONTENT_OPTIONAL_OPS = {"ABSTAIN"}
+
+_OP_CODE = {"STORE_FACT": 1, "UPDATE": 2, "SUPERSEDE": 3, "COMPRESS": 4, "ABSTAIN": 5, "INVALID": 0}
 
 
 def compute_reward(
@@ -23,42 +36,59 @@ def compute_reward(
     ground_truth: str,
     extra_info: dict,
 ) -> float:
-    """Per-step reward for Architecture A (one row per turn).
+    """Per-step format gate.
 
-    Format gate: invalid/unparseable op → -0.5.
-    Valid op with no content (ABSTAIN) → 0.0.
-    Valid op with content → 0.6 * token_F1 + 0.4 * ROUGE1_recall - volume_penalty + 0.1 format bonus.
-
-    The +0.1 format bonus on valid ops with content prevents the model from
-    collapsing to always ABSTAIN for near-zero reward.
+    Does NOT compute quality reward — that is handled by MemoryAgentLoop's
+    terminal score_trajectory call so the signal is trajectory-level, not
+    single-op level (which is too noisy for useful gradient).
     """
-    if not _is_valid_memory_op(solution_str):
-        return -0.5
+    valid   = _is_valid_memory_op(solution_str)
+    content = _extract_content_field(solution_str) if valid else ""
+    op_type = _extract_op_type(solution_str)
 
-    content = _extract_content_field(solution_str)
-    if not content:
-        return 0.0
+    if not valid:
+        reward = -0.5
+    elif not content:   # ABSTAIN
+        reward = 0.0
+    else:
+        reward = 0.1    # format bonus
 
-    # ground_truth is json.dumps(qa_probes) — extract answer strings only so
-    # _token_f1 compares stored content against actual answers, not JSON metadata
-    answer_ref = _extract_answers(ground_truth)
-
-    r_task   = _token_f1(content, answer_ref)
-    r_memory = _rouge1_recall(content, answer_ref)
-    p_volume = min(0.002 * len(content.split()), 0.3)
-
-    # +0.1 bonus for any valid op that stores content (anti-collapse pressure)
-    return max(-1.0, min(1.0, 0.6 * r_task + 0.4 * r_memory - p_volume + 0.1))
+    _log_step(op_type, valid, reward)
+    return reward
 
 
+# ---------------------------------------------------------------------------
+# WandB step logging
+# ---------------------------------------------------------------------------
 
-def _extract_answers(ground_truth: str) -> str:
-    """Pull answer strings out of json.dumps(qa_probes) for clean token-F1."""
+def _log_step(op_type: str, valid: bool, reward: float) -> None:
     try:
-        probes = json.loads(ground_truth)
-        return " ".join(str(p.get("answer", "")) for p in probes if p.get("answer"))
-    except (json.JSONDecodeError, TypeError, AttributeError):
-        return ground_truth
+        import wandb
+        if not wandb.run:
+            return
+        wandb.log({
+            "step/format_valid": float(valid),
+            "step/op_code":      _OP_CODE.get(op_type, 0),
+            "step/reward":       reward,
+        })
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Parsing helpers
+# ---------------------------------------------------------------------------
+
+def _extract_op_type(solution_str: str) -> str:
+    cleaned = re.sub(r"<think>.*?</think>", "", solution_str, flags=re.DOTALL).strip()
+    m = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if not m:
+        return "INVALID"
+    try:
+        d = json.loads(m.group())
+        return d.get("op", "INVALID")
+    except json.JSONDecodeError:
+        return "INVALID"
 
 
 def _is_valid_memory_op(solution_str: str) -> bool:
@@ -79,7 +109,6 @@ def _is_valid_memory_op(solution_str: str) -> bool:
     if op not in _CONTENT_OPTIONAL_OPS:
         if not d.get("content"):
             return False
-        # Non-ABSTAIN ops must have a path (category/entity format)
         path = d.get("path", "")
         if not path or "/" not in path:
             return False
@@ -118,5 +147,3 @@ def _rouge1_recall(hypothesis: str, reference: str) -> float:
     hyp_c = Counter(hyp)
     ref_c = Counter(ref)
     return sum((hyp_c & ref_c).values()) / len(ref)
-
-

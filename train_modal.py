@@ -192,7 +192,7 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS) -> dict:
         f"trainer.experiment_name={run_name}",
         "trainer.n_gpus_per_node=2",
         "trainer.nnodes=1",
-        f"trainer.test_freq={n_steps + 1}",  # skip validation for now; SGLang KV alloc OOMs alongside FSDP
+        f"trainer.test_freq={n_steps + 1}",  # TODO: re-enable once SGLang KV alloc OOM is fixed (set to 50)
         f"trainer.save_freq={min(25, n_steps)}",
         f"trainer.total_training_steps={n_steps}",
         f"trainer.default_local_dir={MODELS_PATH / run_name}",
@@ -396,6 +396,194 @@ def main():
     print("Starting GRPO training with verl + vLLM...")
     result = train.remote(run_name="locomo_lme_run_001")
     print("Done:", result)
+
+
+# ---------------------------------------------------------------------------
+# Diagnose — local, no GPU needed
+# ---------------------------------------------------------------------------
+
+@app.local_entrypoint()
+def diagnose():
+    """Inspect reward coverage and window quality before training.
+
+    Runs locally (no GPU). Simulates build_verl_batch and reports:
+      - How many windows survive the probe-coverage filter
+      - Expected reward floor / ceiling per window
+      - Op type distribution that a base model would need to produce to win
+
+    Run: modal run train_modal.py::diagnose
+    """
+    import sys
+    sys.path.insert(0, str(REPO_ROOT))
+    from agent_loop import build_verl_batch, _resolve_probe_sessions
+    from memory_fs import VirtualFilesystem, score_trajectory
+
+    if not DATA_PATH_LOCAL.exists():
+        print(f"No data at {DATA_PATH_LOCAL}")
+        return
+
+    trajectories = [
+        json.loads(line) for line in DATA_PATH_LOCAL.read_text().strip().split("\n") if line.strip()
+    ]
+    print(f"\n=== Dataset: {len(trajectories)} trajectories ===")
+
+    rows = build_verl_batch(trajectories)
+    print(f"Training rows after window filter: {len(rows)}")
+
+    # Reward floor: empty FS (model ABSTAINs everything)
+    # Reward ceiling: model stores the answer verbatim into the FS
+    floors, ceilings = [], []
+    for row in rows[:200]:
+        probes = row["extra_info"]["qa_probes"]
+        if not probes:
+            continue
+
+        # Floor: empty FS
+        fs_empty = VirtualFilesystem()
+        floors.append(score_trajectory(fs_empty, probes))
+
+        # Ceiling: oracle stores answer verbatim at a relevant path
+        fs_oracle = VirtualFilesystem()
+        for p in probes:
+            fs_oracle.apply_op(
+                {"op": "STORE_FACT", "path": "facts/oracle", "content": str(p.get("answer", ""))},
+                session_idx=0, turn_idx=0,
+            )
+        ceilings.append(score_trajectory(fs_oracle, probes))
+
+    def _stats(vals):
+        n = len(vals)
+        if not n:
+            return "no data"
+        return f"mean={sum(vals)/n:.3f}  min={min(vals):.3f}  max={max(vals):.3f}  >0: {sum(1 for v in vals if v>0)/n:.1%}"
+
+    print(f"\nReward floor  (empty FS):  {_stats(floors)}")
+    print(f"Reward ceiling (oracle FS): {_stats(ceilings)}")
+
+    # Probe count distribution
+    probe_counts = [len(r["extra_info"]["qa_probes"]) for r in rows]
+    print(f"\nProbes per window: mean={sum(probe_counts)/len(probe_counts):.1f}  "
+          f"max={max(probe_counts)}  1-probe: {sum(1 for c in probe_counts if c==1)/len(probe_counts):.1%}")
+
+    # Vertical split
+    from collections import Counter
+    verticals = Counter(r["data_source"] for r in rows)
+    print(f"\nVertical split: {dict(verticals)}")
+
+    print("\nTo run baseline eval on base model (no RL): modal run train_modal.py::baseline")
+
+
+# ---------------------------------------------------------------------------
+# Baseline eval — runs base Qwen3-8B with no LoRA
+# ---------------------------------------------------------------------------
+
+@app.function(
+    image=image,
+    gpu="A100-80GB:1",
+    timeout=90 * MINUTES,
+    volumes={MODELS_PATH: checkpoints_volume, DATA_PATH: data_volume, "/hf-cache": hf_cache_vol},
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+)
+def _baseline_eval_remote(n_trajectories: int = 20) -> dict:
+    """Run base Qwen3-8B (no RL) on test sets to establish the reward floor.
+
+    This is the number the trained model must beat. Run once before the big run.
+    """
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    import torch, sys
+    sys.path.insert(0, "/root")
+    from memory_fs import VirtualFilesystem, parse_op, score_trajectory
+    from agent_loop import _SYSTEM_PROMPT, _format_turn
+
+    data_volume.reload()
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    model     = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16, device_map="auto")
+    model.eval()
+
+    all_results = {}
+
+    for dataset in ("locomo", "longmemeval"):
+        test_path = DATA_PATH / f"{dataset}_test.jsonl"
+        if not test_path.exists():
+            print(f"[{dataset}] no test file — skipping")
+            continue
+
+        trajectories = [
+            json.loads(line) for line in test_path.read_text().strip().split("\n") if line.strip()
+        ]
+        if n_trajectories > 0:
+            trajectories = trajectories[:n_trajectories]
+
+        print(f"\n[{dataset}] {len(trajectories)} trajectories (base model, no RL)")
+
+        traj_rewards, abstain_counts = [], []
+
+        for traj in trajectories:
+            sessions    = traj.get("sessions", [])
+            qa_probes   = traj.get("qa_probes", [])
+            fs          = VirtualFilesystem()
+            traj_ops    = 0
+            traj_abstains = 0
+
+            for s_idx, session in enumerate(sessions):
+                for t_idx, turn in enumerate(session.get("turns", [])):
+                    content = turn.get("content", "").strip()
+                    if not content:
+                        continue
+
+                    messages = [
+                        {"role": "system", "content": _SYSTEM_PROMPT},
+                        {"role": "user",   "content": (
+                            f"[Memory state]\n{fs.render_for_prompt()}\n\n"
+                            f"[Current turn]\n{_format_turn(turn)}"
+                        )},
+                    ]
+
+                    ids = tokenizer.apply_chat_template(
+                        messages, return_tensors="pt", add_generation_prompt=True
+                    ).to("cuda")
+
+                    with torch.no_grad():
+                        out = model.generate(ids, max_new_tokens=256, do_sample=False)
+
+                    response = tokenizer.decode(out[0][ids.shape[1]:], skip_special_tokens=True)
+                    op = parse_op(response)
+                    fs.apply_op(op, session_idx=s_idx, turn_idx=t_idx)
+                    traj_ops += 1
+                    if op.get("op") == "ABSTAIN" or not op:
+                        traj_abstains += 1
+
+            traj_rewards.append(score_trajectory(fs, qa_probes))
+            abstain_counts.append(traj_abstains / max(traj_ops, 1))
+
+        n      = len(traj_rewards)
+        mean_r = sum(traj_rewards) / n
+        print(f"[{dataset}] BASE MODEL — mean FS-QA F1: {mean_r:.3f}  abstain: {sum(abstain_counts)/n:.1%}")
+
+        all_results[dataset] = {
+            "n":             n,
+            "mean_fs_qa_f1": round(mean_r, 4),
+            "abstain_rate":  round(sum(abstain_counts) / n, 4),
+            "model":         "base (no RL)",
+        }
+
+    return all_results
+
+
+@app.local_entrypoint()
+def baseline():
+    """Run base Qwen3-8B eval — establishes the floor the RL model must beat.
+
+    Run once before the big training run.
+    Run: modal run train_modal.py::baseline
+    """
+    print("Running baseline eval on base Qwen3-8B (no RL)...")
+    results = _baseline_eval_remote.remote(n_trajectories=20)
+    print("\n=== BASELINE RESULTS ===")
+    for dataset, metrics in results.items():
+        print(f"  {dataset}: FS-QA F1 = {metrics['mean_fs_qa_f1']:.3f}  "
+              f"abstain = {metrics['abstain_rate']:.1%}")
 
 
 
