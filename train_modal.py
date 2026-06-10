@@ -172,7 +172,7 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS) -> dict:
         "actor_rollout_ref.rollout.gpu_memory_utilization=0.48",  # 0.48×79.25-4.14=33.9GB KV; fits warmup(23.6GB) and leaves 2GB free after KV resume for generation
         "actor_rollout_ref.rollout.free_cache_engine=True",
         "actor_rollout_ref.rollout.enforce_eager=True",
-        "+actor_rollout_ref.rollout.multi_stage_wake_up=True",   # resume weights→state_dict→resume KV; prevents state_dict OOM when KV+weights+alloc all compete
+        "actor_rollout_ref.rollout.multi_stage_wake_up=True",    # resume weights→state_dict→resume KV; prevents state_dict OOM when KV+weights+alloc all compete
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2",
         f"actor_rollout_ref.rollout.n={N_ROLLOUTS}",
         # multi-turn AgentLoop
