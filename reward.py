@@ -24,10 +24,10 @@ from collections import Counter
 
 from memory_fs import _token_f1, _normalize
 
-_VALID_OPS            = {"STORE_FACT", "UPDATE", "SUPERSEDE", "COMPRESS", "ABSTAIN"}
-_CONTENT_OPTIONAL_OPS = {"ABSTAIN"}
+_VALID_OPS            = {"STORE_FACT", "UPDATE", "SUPERSEDE", "COMPRESS", "ABSTAIN", "RESOLVE", "RETRIEVE"}
+_CONTENT_OPTIONAL_OPS = {"ABSTAIN", "RETRIEVE"}  # RETRIEVE uses "query" not "content"
 
-_OP_CODE = {"STORE_FACT": 1, "UPDATE": 2, "SUPERSEDE": 3, "COMPRESS": 4, "ABSTAIN": 5, "INVALID": 0}
+_OP_CODE = {"STORE_FACT": 1, "UPDATE": 2, "SUPERSEDE": 3, "COMPRESS": 4, "ABSTAIN": 5, "RESOLVE": 6, "INVALID": 0}
 
 
 def compute_reward(
@@ -109,9 +109,11 @@ def _is_valid_memory_op(solution_str: str) -> bool:
     if op not in _CONTENT_OPTIONAL_OPS:
         if not d.get("content"):
             return False
-        path = d.get("path", "")
-        if not path or "/" not in path:
-            return False
+        # RESOLVE and RETRIEVE don't use a path — all write ops do
+        if op not in ("RESOLVE", "RETRIEVE"):
+            path = d.get("path", "")
+            if not path or "/" not in path:
+                return False
 
     return True
 

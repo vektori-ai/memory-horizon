@@ -30,6 +30,10 @@ MODEL_ID    = "Qwen/Qwen3-8B"
 N_ROLLOUTS  = 2      # completions per prompt (4 OOMs at 20-turn episodes; 2 halves KV pressure)
 N_STEPS     = 500
 
+# Context-1 retrieval service — deploy context1_service.py first, then paste the URL here.
+# Leave empty to fall back to keyword grep during training.
+CONTEXT1_SERVICE_URL = ""
+
 DATA_PATH      = Path("/data")
 MODELS_PATH    = Path("/models")
 MINUTES        = 60
@@ -48,10 +52,13 @@ image = (
     # Reinstall verl Python sources at exact 0.5.0 without touching flash_attn/torch
     # (--no-deps keeps base image binaries intact, avoiding the flash_attn ABI conflict)
     .run_commands("pip install --no-deps verl==0.5.0")
-    .add_local_file(Path(__file__).parent / "patch_verl.py",  "/root/patch_verl.py",  copy=True)
-    .add_local_file(Path(__file__).parent / "reward.py",      "/root/reward.py",      copy=True)
-    .add_local_file(Path(__file__).parent / "memory_fs.py",   "/root/memory_fs.py",   copy=True)
-    .add_local_file(Path(__file__).parent / "agent_loop.py",  "/root/agent_loop.py",  copy=True)
+    .add_local_file(Path(__file__).parent / "patch_verl.py",        "/root/patch_verl.py",        copy=True)
+    .add_local_file(Path(__file__).parent / "reward.py",            "/root/reward.py",            copy=True)
+    .add_local_file(Path(__file__).parent / "memory_fs.py",         "/root/memory_fs.py",         copy=True)
+    .add_local_file(Path(__file__).parent / "ledger.py",            "/root/ledger.py",            copy=True)
+    .add_local_file(Path(__file__).parent / "harness_state.py",     "/root/harness_state.py",     copy=True)
+    .add_local_file(Path(__file__).parent / "agent_loop.py",        "/root/agent_loop.py",        copy=True)
+    .add_local_file(Path(__file__).parent / "context1_service.py",  "/root/context1_service.py",  copy=True)
     .run_commands("python /root/patch_verl.py")
     .env({
         "HF_HOME": "/hf-cache",
@@ -98,6 +105,11 @@ def prep(jsonl_data: str, test_jsonls: dict[str, str] | None = None) -> None:
 
     train_examples = build_verl_batch(train_trajs)
     val_examples   = build_verl_batch(val_trajs)
+
+    # Stamp Context-1 URL into every row so the agent loop can call it during rollouts
+    if CONTEXT1_SERVICE_URL:
+        for row in train_examples + val_examples:
+            row["extra_info"]["context1_url"] = CONTEXT1_SERVICE_URL
     print(f"Trajectories — train: {len(train_trajs)}, val: {len(val_trajs)}")
     print(f"Episode windows — train: {len(train_examples)}, val: {len(val_examples)}")
 

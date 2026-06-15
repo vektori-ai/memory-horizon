@@ -31,7 +31,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from memory_horizon.mh_types import QAPair, Session, Trajectory, Turn
+from mh_types import QAPair, Session, Trajectory, Turn
 
 # Conversations used for each split — matches Memory-R1
 TRAIN_IDS = {"conv-26"}

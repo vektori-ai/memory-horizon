@@ -39,6 +39,10 @@ class MemoryOp(str, Enum):
     COMPRESS        = "COMPRESS"         # lossy summarization of existing memory block
     ABSTAIN         = "ABSTAIN"          # explicit refusal: memory lacks the answer
 
+    # Harness-facing ops (agent calls these, harness executes them)
+    RETRIEVE        = "RETRIEVE"         # search own memory via Context-1; harness returns slice
+    RESOLVE         = "RESOLVE"          # emit answer for a probe question
+
 
 STORE_OPS: frozenset[MemoryOp] = frozenset({
     MemoryOp.STORE_FACT,

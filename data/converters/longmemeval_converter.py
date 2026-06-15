@@ -32,7 +32,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from memory_horizon.mh_types import QAPair, Session, Trajectory, Turn
+from mh_types import QAPair, Session, Trajectory, Turn
 
 N_TRAIN = 60
 N_VAL   = 40

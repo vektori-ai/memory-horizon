@@ -80,15 +80,47 @@ def parse_op(response_str: str) -> dict:
         return {}
 
 
-def score_trajectory(fs: VirtualFilesystem, qa_probes: list) -> float:
-    """Terminal reward: average token-F1 of grepped FS content vs each answer.
+def retrieve_for_probe(
+    query: str,
+    fs: "VirtualFilesystem",
+    context1_url: str | None = None,
+) -> str:
+    """Return FS entries relevant to query.
 
-    Greps FS lines that share tokens with the question, then compares
-    the retrieved text to the expected answer via token-F1.
+    Uses Context-1 retrieval service when context1_url is set; falls back to
+    keyword grep otherwise (training without the service, or local testing).
+    """
+    all_lines = [line for lines in fs.files.values() for line in lines]
+    if not all_lines:
+        return ""
+
+    if context1_url:
+        try:
+            import urllib.request, json as _json
+            payload = _json.dumps({"query": query, "documents": all_lines}).encode()
+            req = urllib.request.Request(
+                f"{context1_url.rstrip('/')}/retrieve",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = _json.loads(resp.read())
+            results = data.get("results", [])
+            return " ".join(results) if results else _grep_relevant(fs.to_text(), query)
+        except Exception:
+            pass  # fall through to grep on any error
+
+    return _grep_relevant(fs.to_text(), query)
+
+
+def score_trajectory(fs: VirtualFilesystem, qa_probes: list, context1_url: str | None = None) -> float:
+    """Terminal reward: average token-F1 of retrieved FS content vs each answer.
+
+    Uses Context-1 for retrieval when context1_url is provided, else keyword grep.
     Returns 0.0 if no scoreable probes exist.
     """
-    fs_text = fs.to_text()
-    scores  = []
+    scores = []
 
     for probe in qa_probes:
         if isinstance(probe, dict):
@@ -101,7 +133,7 @@ def score_trajectory(fs: VirtualFilesystem, qa_probes: list) -> float:
         if not answer or answer in ("ABSTAIN", "Yes", "No", "N/A", ""):
             continue
 
-        relevant = _grep_relevant(fs_text, question)
+        relevant = retrieve_for_probe(question, fs, context1_url)
         scores.append(_token_f1(relevant, answer))
 
     return sum(scores) / len(scores) if scores else 0.0

@@ -1,25 +1,26 @@
 """Multi-turn memory agent loop for verl v0.5.0 GRPO training.
 
 Two responsibilities:
-  1. build_verl_batch()     — data-prep: slices trajectories into K-turn episode
-                              windows and returns raw_chat format rows for verl.
-  2. MemoryAgentLoop        — rollout: implements verl's AgentLoopBase, runs K turns
-                              of model inference while building the VirtualFilesystem,
-                              returns AgentLoopOutput with proper response_mask.
+  1. build_verl_batch()  — data-prep: slices trajectories into K-turn episode
+                           windows and returns raw_chat format rows for verl.
+  2. MemoryAgentLoop     — rollout: verl AgentLoopBase implementation.
 
-Episode design (K=20 turns, stride=10):
-  Each episode window = K consecutive turns from one trajectory.
-  Turn 0: model sees (system_prompt + empty FS + turn_0) → outputs op_0
-  Turn t: model sees (system_prompt + FS_after_t-1 + turn_t) → outputs op_t
-  Terminal: score_trajectory(FS, window_probes) → reward R
-  step-wise GRPO broadcasts R to all model-generated tokens in the episode.
+Episode flow:
+  Turn 0..K: model sees (system + harness context + turn) → emits op
+    WRITE ops    → applied to FS, scored against ledger (step reward)
+    RETRIEVE ops → harness calls Context-1, result injected as observation
+    ABSTAIN      → no-op write, logged
+  Probe phase: for each QA probe in window
+    → harness injects [FS + retrieved slice + question]
+    → model emits RESOLVE(answer)
+    → scored against gold (terminal reward)
+  Final reward = MemoryHarnessState.compute_reward()
 
-Window filtering:
-  Each window is only included if it covers at least one probe-relevant session.
-  For LoCoMo, probe.requires_sessions are real session IDs.
-  For LongMemEval, requires_sessions are answer-source IDs that don't match session IDs;
-  we resolve these by searching session content for the answer text.
-  Windows with 0 scoreable probes are skipped — they contribute zero gradient signal.
+Architecture mirrors harness-1:
+  MemoryHarnessState ↔ WorkingMemory
+  RETRIEVE action    ↔ search_corpus tool
+  RESOLVE action     ↔ user_text (final answer)
+  Ledger             ↔ answer documents ground truth
 """
 
 from __future__ import annotations
@@ -28,7 +29,9 @@ import json
 from collections import Counter
 from typing import TYPE_CHECKING
 
-from memory_fs import VirtualFilesystem, parse_op, score_trajectory
+from ledger import derive_ledger
+from harness_state import MemoryHarnessState
+from memory_fs import parse_op, retrieve_for_probe
 
 if TYPE_CHECKING:
     from mh_types import Trajectory
@@ -42,9 +45,9 @@ EPISODE_STRIDE  = 5    # stride between windows (overlap = WINDOW - STRIDE)
 
 _SYSTEM_PROMPT = """\
 You are a memory manager for a long-running conversational AI.
-As each conversation turn arrives, decide what to store, update, or compress in your memory filesystem.
+As each conversation turn arrives, decide what to store, update, retrieve, or compress.
 
-Your memory is organised as files under category paths:
+Your memory is a filesystem of category paths:
   people/   — facts about individuals
   events/   — past and future events
   places/   — locations and addresses
@@ -52,14 +55,20 @@ Your memory is organised as files under category paths:
   prefs/    — preferences and habits
 
 Output a single JSON object (no explanation):
-{"op": "<STORE_FACT|UPDATE|SUPERSEDE|COMPRESS|ABSTAIN>", "path": "<category/entity>", "content": "<what to store>"}
 
-Op rules:
-  STORE_FACT  : new fact not yet stored; path = category/entity (e.g. people/alice)
-  UPDATE      : existing fact changed or was wrong — replace current entry at path
-  SUPERSEDE   : stronger overwrite — all prior entries at path replaced by this one
-  COMPRESS    : collapse verbose path lines into one summary
-  ABSTAIN     : no storable information in this turn
+Write ops (modify the filesystem):
+  {"op": "STORE_FACT",  "path": "category/entity", "content": "what to store"}
+  {"op": "UPDATE",      "path": "category/entity", "content": "updated value"}
+  {"op": "SUPERSEDE",   "path": "category/entity", "content": "new value replacing all prior"}
+  {"op": "COMPRESS",    "path": "category/entity", "content": "summary of this path"}
+  {"op": "ABSTAIN"}
+
+Retrieval op (search your memory before writing or answering):
+  {"op": "RETRIEVE", "query": "what you want to look up"}
+  The harness will return relevant entries from your memory.
+
+Answer op (only when asked a probe question):
+  {"op": "RESOLVE", "content": "your answer based on retrieved memory"}
 /nothink"""
 
 
@@ -184,12 +193,14 @@ def build_verl_batch(
                 "ability":      "memory_management",
                 "reward_model": {"ground_truth": json.dumps(scoreable)},
                 "extra_info": {
-                    "trajectory_id":    traj_id,
-                    "window_start":     win_start,
-                    "first_turn":       first_turn,
-                    "rest_turns":       rest_turns,
-                    "qa_probes":        scoreable,
+                    "trajectory_id":      traj_id,
+                    "window_start":       win_start,
+                    "first_turn":         first_turn,
+                    "rest_turns":         rest_turns,
+                    "qa_probes":          scoreable,
                     "window_session_ids": list(window_session_ids),
+                    "sessions":           sessions,   # needed by derive_ledger
+                    "context1_url":       "",  # filled in by train_modal.py at prep time
                 },
             })
 
@@ -239,13 +250,13 @@ class MemoryAgentLoop:
         if AgentLoopBase is None:
             raise ImportError("verl not installed — MemoryAgentLoop requires verl v0.5.0")
 
-        extra = sampling_params.get("extra_info", {})
-        rest_turns       = extra.get("rest_turns", [])
-        qa_probes        = extra.get("qa_probes", [])
-        window_sids      = set(extra.get("window_session_ids", []))
+        extra        = sampling_params.get("extra_info", {})
+        rest_turns   = extra.get("rest_turns", [])
+        qa_probes    = extra.get("qa_probes", [])
+        window_sids  = set(extra.get("window_session_ids", []))
+        context1_url = extra.get("context1_url") or None
+        sessions     = extra.get("sessions", [])
 
-        # Filter probes to window-relevant ones (already filtered in build_verl_batch,
-        # but re-filter here in case extra_info was serialized without window_session_ids)
         if window_sids:
             filtered = [
                 p for p in qa_probes
@@ -255,62 +266,98 @@ class MemoryAgentLoop:
             if filtered:
                 qa_probes = filtered
 
-        fs             = VirtualFilesystem()
-        all_prompt_ids = []
-        all_resp_ids   = []
-        all_resp_mask  = []
-        all_responses  = []   # raw text per step, for logging
-        session_idx    = extra.get("first_turn", {}).get("session_idx", 0)
-        turn_offset    = extra.get("first_turn", {}).get("turn_idx", 0)
+        # Build harness state — the WorkingMemory analog
+        ledger  = derive_ledger(qa_probes, sessions)
+        harness = MemoryHarnessState(ledger=ledger)
 
+        all_prompt_ids   = []
+        all_resp_ids     = []
+        all_resp_mask    = []
+        all_responses    = []
+        session_idx      = extra.get("first_turn", {}).get("session_idx", 0)
+        turn_offset      = extra.get("first_turn", {}).get("turn_idx", 0)
         current_messages = list(messages)
 
+        # ── Conversation turns phase ───────────────────────────────────────
         for step_idx in range(1 + len(rest_turns)):
             step_prompt_ids = self.tokenize(current_messages)
-
             if step_idx == 0:
                 all_prompt_ids = step_prompt_ids
 
-            response_ids, response_text = await self.generate(
-                step_prompt_ids, sampling_params
-            )
+            response_ids, response_text = await self.generate(step_prompt_ids, sampling_params)
             all_responses.append(response_text)
-
-            op = parse_op(response_text)
-            fs.apply_op(
-                op,
-                session_idx=op.get("_s", session_idx),
-                turn_idx=turn_offset + step_idx,
-            )
-
             all_resp_ids  += response_ids
             all_resp_mask += [1] * len(response_ids)
 
-            if step_idx < len(rest_turns):
-                next_turn = rest_turns[step_idx]
+            op      = parse_op(response_text)
+            op_type = op.get("op", "INVALID") if op else "INVALID"
 
-                # Truncate FS to last 30 lines to bound context growth during multi-turn episodes
-                fs_text  = fs.render_for_prompt()
-                fs_lines = fs_text.split("\n")
-                if len(fs_lines) > 30:
-                    fs_text = "\n".join(fs_lines[-30:]) + "\n[...truncated]"
+            if op_type == "RETRIEVE":
+                # Agent explicitly searches its own memory — harness executes Context-1
+                query   = op.get("query", "").strip()
+                results = retrieve_for_probe(query, harness.fs, context1_url)
+                harness.apply_retrieve(query, [results] if results else [], turn_offset + step_idx)
 
-                observation = (
-                    f"\n[Memory state]\n{fs_text}\n\n"
-                    f"[Next turn]\n{_format_turn(next_turn)}"
+                retrieve_obs = (
+                    f"\n[Retrieved for: {query}]\n"
+                    f"{results or '(no relevant entries found)'}"
                 )
-                obs_ids = self.tokenize_text(observation)
-                all_resp_ids  += obs_ids
-                all_resp_mask += [0] * len(obs_ids)
-
+                ret_ids = self.tokenize_text(retrieve_obs)
+                all_resp_ids  += ret_ids
+                all_resp_mask += [0] * len(ret_ids)   # harness output, not trained on
                 current_messages = current_messages + [
                     {"role": "assistant", "content": response_text},
-                    {"role": "user",      "content": observation},
+                    {"role": "user",      "content": retrieve_obs},
                 ]
+            else:
+                # All write ops (STORE_FACT, UPDATE, SUPERSEDE, COMPRESS, ABSTAIN)
+                harness.apply_op(op, session_idx=session_idx, turn_idx=turn_offset + step_idx)
 
-        reward = score_trajectory(fs, qa_probes)
+                if step_idx < len(rest_turns):
+                    next_turn   = rest_turns[step_idx]
+                    observation = (
+                        f"\n[Memory state]\n{harness.render_context()}\n\n"
+                        f"[Next turn]\n{_format_turn(next_turn)}"
+                    )
+                    obs_ids = self.tokenize_text(observation)
+                    all_resp_ids  += obs_ids
+                    all_resp_mask += [0] * len(obs_ids)
+                    current_messages = current_messages + [
+                        {"role": "assistant", "content": response_text},
+                        {"role": "user",      "content": observation},
+                    ]
 
-        _log_episode_stats(all_responses, reward, len(qa_probes))
+        # ── Probe / RESOLVE phase ──────────────────────────────────────────
+        for probe in qa_probes:
+            question = probe.get("question", "") if isinstance(probe, dict) else getattr(probe, "question", "")
+            answer   = str(probe.get("answer", "") if isinstance(probe, dict) else getattr(probe, "answer", ""))
+            if not answer or answer.lower() in ("abstain", "yes", "no", "n/a", ""):
+                continue
+
+            retrieved = retrieve_for_probe(question, harness.fs, context1_url)
+            probe_obs = (
+                f"\n[Memory state]\n{harness.render_context()}\n\n"
+                f"[Retrieved]\n{retrieved or '(no relevant entries found)'}\n\n"
+                f"[Question]\n{question}"
+            )
+            probe_messages   = current_messages + [{"role": "user", "content": probe_obs}]
+            probe_prompt_ids = self.tokenize(probe_messages)
+            resolve_ids, resolve_text = await self.generate(probe_prompt_ids, sampling_params)
+
+            all_resp_ids  += resolve_ids
+            all_resp_mask += [1] * len(resolve_ids)
+            all_responses.append(resolve_text)
+
+            resolve_op      = parse_op(resolve_text)
+            resolve_content = (
+                resolve_op.get("content", "")
+                if resolve_op and resolve_op.get("op") == "RESOLVE"
+                else resolve_text.strip()   # fallback: treat raw text as answer
+            )
+            harness.apply_resolve(resolve_content, answer)
+
+        reward = harness.compute_reward()
+        _log_episode_stats(all_responses, harness.summary())
 
         return AgentLoopOutput(
             prompt_ids    = all_prompt_ids,
@@ -338,24 +385,25 @@ class MemoryAgentLoop:
 # Logging helper
 # ---------------------------------------------------------------------------
 
-def _log_episode_stats(responses: list[str], terminal_reward: float, n_probes: int) -> None:
+def _log_episode_stats(responses: list[str], summary: dict) -> None:
     """Log per-episode stats to WandB if a run is active."""
     try:
         import wandb
         if not wandb.run:
             return
-        op_types = [parse_op(r).get("op", "INVALID") for r in responses]
-        counts   = Counter(op_types)
-        n        = max(len(op_types), 1)
+        op_counts = summary.get("op_counts", {})
+        n         = max(sum(op_counts.values()), 1)
         wandb.log({
-            "episode/terminal_reward":  terminal_reward,
-            "episode/n_probes":         n_probes,
-            "episode/abstain_rate":     counts.get("ABSTAIN", 0) / n,
-            "episode/store_rate":       counts.get("STORE_FACT", 0) / n,
-            "episode/update_rate":      (counts.get("UPDATE", 0) + counts.get("SUPERSEDE", 0)) / n,
-            "episode/compress_rate":    counts.get("COMPRESS", 0) / n,
-            "episode/invalid_rate":     counts.get("INVALID", 0) / n,
-            "episode/fs_paths":         0,   # placeholder; fs not accessible here
+            "episode/reward":          summary.get("final_reward", 0.0),
+            "episode/mean_resolve":    summary.get("mean_resolve", 0.0),
+            "episode/mean_step":       summary.get("mean_step", 0.0),
+            "episode/n_retrievals":    summary.get("n_retrievals", 0),
+            "episode/n_fs_paths":      len(summary.get("fs_paths", [])),
+            "episode/abstain_rate":    op_counts.get("ABSTAIN", 0) / n,
+            "episode/store_rate":      op_counts.get("STORE_FACT", 0) / n,
+            "episode/update_rate":     (op_counts.get("UPDATE", 0) + op_counts.get("SUPERSEDE", 0)) / n,
+            "episode/retrieve_rate":   op_counts.get("RETRIEVE", 0) / n,
+            "episode/invalid_rate":    op_counts.get("INVALID", 0) / n,
         })
     except Exception:
         pass
