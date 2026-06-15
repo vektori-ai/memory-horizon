@@ -128,6 +128,118 @@ def prep(jsonl_data: str, test_jsonls: dict[str, str] | None = None) -> None:
 
 
 # ---------------------------------------------------------------------------
+# SFT — fine-tune Qwen3-8B on GPT-OSS-generated memory op demonstrations
+# ---------------------------------------------------------------------------
+
+@app.function(
+    image=image,
+    gpu="A100-80GB:2",
+    timeout=3 * 60 * MINUTES,
+    volumes={
+        MODELS_PATH: checkpoints_volume,
+        DATA_PATH:   data_volume,
+        "/hf-cache": hf_cache_vol,
+    },
+    secrets=[modal.Secret.from_name("huggingface-secret"), modal.Secret.from_name("wandb-secret")],
+)
+def sft(sft_jsonl: str, run_name: str = "sft_warmup", n_epochs: int = 1) -> dict:
+    """SFT warm-up on GPT-OSS-generated traces before GRPO.
+
+    Trains Qwen3-8B with LoRA for n_epochs on the demonstration traces.
+    Saves checkpoint to /models/{run_name} so train() can resume from it.
+
+    Args:
+        sft_jsonl: raw JSONL string of SFT traces (from gen_sft.py)
+        run_name:  checkpoint name
+        n_epochs:  epochs to train (1 is usually enough for format learning)
+    """
+    import json as _json
+    import sys
+    import torch
+    from pathlib import Path as _Path
+    from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer
+    from peft import LoraConfig, get_peft_model, TaskType
+    from torch.utils.data import Dataset
+
+    data_volume.reload()
+
+    class SFTDataset(Dataset):
+        def __init__(self, traces: list[dict], tokenizer, max_len: int = 1024):
+            self.tokenizer = tokenizer
+            self.max_len   = max_len
+            self.examples  = []
+            for t in traces:
+                msgs = t.get("messages", [])
+                if not msgs:
+                    continue
+                text = tokenizer.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=False
+                )
+                self.examples.append(text)
+
+        def __len__(self):
+            return len(self.examples)
+
+        def __getitem__(self, idx):
+            enc = self.tokenizer(
+                self.examples[idx],
+                max_length=self.max_len,
+                truncation=True,
+                padding="max_length",
+                return_tensors="pt",
+            )
+            ids    = enc["input_ids"].squeeze()
+            labels = ids.clone()
+            # mask padding
+            labels[labels == self.tokenizer.pad_token_id] = -100
+            return {"input_ids": ids, "attention_mask": enc["attention_mask"].squeeze(), "labels": labels}
+
+    traces = [_json.loads(l) for l in sft_jsonl.strip().split("\n") if l.strip()]
+    print(f"[sft] {len(traces)} traces loaded")
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID, torch_dtype=torch.bfloat16, device_map="auto"
+    )
+    lora_cfg = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=32, lora_alpha=32,
+        target_modules="all-linear",
+        lora_dropout=0.05,
+        bias="none",
+    )
+    model = get_peft_model(model, lora_cfg)
+    model.print_trainable_parameters()
+
+    dataset  = SFTDataset(traces, tokenizer)
+    ckpt_dir = str(MODELS_PATH / run_name)
+
+    args = TrainingArguments(
+        output_dir=ckpt_dir,
+        num_train_epochs=n_epochs,
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=4,
+        learning_rate=2e-4,
+        lr_scheduler_type="cosine",
+        warmup_ratio=0.05,
+        bf16=True,
+        logging_steps=10,
+        save_strategy="epoch",
+        report_to="wandb",
+        run_name=run_name,
+    )
+    Trainer(model=model, args=args, train_dataset=dataset).train()
+
+    model.save_pretrained(ckpt_dir)
+    tokenizer.save_pretrained(ckpt_dir)
+    checkpoints_volume.commit()
+    print(f"[sft] checkpoint saved → {ckpt_dir}")
+    return {"run_name": run_name, "n_traces": len(traces), "checkpoint": ckpt_dir}
+
+
+# ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 
@@ -486,6 +598,59 @@ def diagnose():
     print(f"\nVertical split: {dict(verticals)}")
 
     print("\nTo run baseline eval on base model (no RL): modal run train_modal.py::baseline")
+
+
+# ---------------------------------------------------------------------------
+# Local entrypoints for SFT
+# ---------------------------------------------------------------------------
+
+@app.local_entrypoint()
+def run_sft():
+    """Generate SFT traces with GPT-OSS 120B, then fine-tune Qwen3-8B.
+
+    Prerequisites:
+        1. python data/download_data.py          (downloads LoCoMo)
+        2. export OPENAI_API_KEY=sk-...
+        3. modal run train_modal.py::run_sft
+
+    After this completes, run GRPO warm-started from the SFT checkpoint:
+        modal run train_modal.py::train_only
+    """
+    import subprocess, os, sys
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        print("Error: OPENAI_API_KEY not set")
+        sys.exit(1)
+
+    locomo_src = REPO_ROOT / "data" / "locomo10.json"
+    sft_out    = REPO_ROOT / "data" / "sft_traces.jsonl"
+
+    if not locomo_src.exists():
+        print(f"Error: {locomo_src} not found — run python data/download_data.py first")
+        sys.exit(1)
+
+    # Generate traces locally (cheap API calls, no GPU needed)
+    if not sft_out.exists():
+        print("Generating SFT traces with GPT-OSS 120B ...")
+        result = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "data" / "gen_sft.py"),
+             "--src", str(locomo_src), "--out", str(sft_out), "--n", "200"],
+            env={**os.environ, "OPENAI_API_KEY": api_key},
+        )
+        if result.returncode != 0:
+            print("gen_sft.py failed")
+            sys.exit(1)
+    else:
+        n = sft_out.read_text().count("\n")
+        print(f"SFT traces already at {sft_out} ({n} lines), skipping generation")
+
+    sft_jsonl = sft_out.read_text()
+    n_traces  = sft_jsonl.count("\n")
+    print(f"Uploading {n_traces} traces to Modal and starting SFT ...")
+    result = sft.remote(sft_jsonl=sft_jsonl, run_name="sft_warmup", n_epochs=1)
+    print("SFT done:", result)
+    print("\nNext: modal run train_modal.py::train_only")
 
 
 # ---------------------------------------------------------------------------
