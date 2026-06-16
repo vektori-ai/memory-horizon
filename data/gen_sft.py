@@ -138,12 +138,22 @@ def generate(
     with open(locomo_path) as f:
         raw = json.load(f)
 
-    # Use only the train conversation (conv-26) — same as Memory-R1
-    train_convs = [c for c in raw if c.get("sample_id") in {"conv-26"}]
+    # Use all conversations — single-conv training (conv-26 only) gives the
+    # SFT warm-start almost no op-type diversity across different memory
+    # patterns. More conversations = more varied fact structures the model
+    # has to learn to operate on before GRPO starts.
+    train_convs = sorted(raw, key=lambda c: c.get("sample_id", ""))
     if not train_convs:
-        # fall back to first conversation if split not found
-        train_convs = raw[:1]
-        print(f"[warn] conv-26 not found, using first conversation")
+        print("[warn] No conversations found in LoCoMo data")
+        return 0
+
+    # Cap per-conversation so traces are spread across convs rather than
+    # exhausted from the first one. Round up so we still hit n_target even
+    # with a small corpus.
+    import math
+    per_conv_cap = math.ceil(n_target / len(train_convs))
+    max_per_conv = min(max_per_conv, per_conv_cap)
+    print(f"[info] {len(train_convs)} conversations, cap {max_per_conv}/conv → target {n_target}")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     traces_written = 0

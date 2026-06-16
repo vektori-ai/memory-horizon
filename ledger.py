@@ -12,7 +12,6 @@ The ledger is used ONLY to compute reward. The agent never sees it.
 
 from __future__ import annotations
 
-import re
 import string
 from collections import Counter
 from dataclasses import dataclass, field
@@ -32,11 +31,16 @@ class LedgerEntry:
     valid_after_session: session_id after which this fact is "current".
                          None = valid from the start of the trajectory.
     probe_question:    original question (kept for debugging).
+    session_order:     ordered list of all session IDs in this trajectory
+                       (populated by derive_ledger). Required for temporal
+                       validity: an entry is "current" only if valid_after_session
+                       comes at or before current_session_id in this list.
     """
     fact_key: str
     expected_content: str
     valid_after_session: str | None
     probe_question: str
+    session_order: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -86,6 +90,7 @@ def derive_ledger(
             expected_content=answer,
             valid_after_session=valid_after,
             probe_question=question,
+            session_order=all_sids,
         ))
 
     return entries
@@ -122,7 +127,7 @@ def score_write_against_ledger(
         if overlap < 0.3:          # below threshold — ignore
             continue
 
-        if _session_is_valid(entry.valid_after_session, current_session_id):
+        if _session_is_valid(entry.valid_after_session, current_session_id, entry.session_order):
             best_pos = max(best_pos, overlap * 0.15)
         else:
             best_neg = max(best_neg, overlap * 0.10)
@@ -151,7 +156,7 @@ def score_invalidate_against_ledger(
         overlap = _token_f1(superseded_content, entry.expected_content)
         if overlap < 0.3:
             continue
-        if not _session_is_valid(entry.valid_after_session, current_session_id):
+        if not _session_is_valid(entry.valid_after_session, current_session_id, entry.session_order):
             return 0.10
 
     return 0.0
@@ -196,16 +201,26 @@ def _token_f1(pred: str, gold: str) -> float:
 def _session_is_valid(
     valid_after: str | None,
     current_sid: str | None,
+    session_order: list[str] | None = None,
 ) -> bool:
     """True if the ledger entry is "current" at current_sid.
 
-    We don't have a global session ordering here, so we use a simple heuristic:
-    if valid_after is None (valid from start) → always valid.
-    if current_sid is None (unknown) → assume valid.
-    Otherwise → valid (we can't order without the full session list;
-    the trajectory-level check in derive_ledger already anchors the entry).
+    Uses session_order (the ordered list of all session IDs in this trajectory,
+    populated in each LedgerEntry by derive_ledger) to determine whether
+    valid_after_session has been processed before current_sid. An entry is
+    valid iff valid_after appears at or before current_sid in the ordering.
+
+    Graceful fallbacks: if either arg is None, or if either ID is absent from
+    session_order (can happen for unknown/external sessions), assume valid so
+    we don't silently null out the step reward for ambiguous cases.
     """
     if valid_after is None or current_sid is None:
         return True
-    return True   # Phase A: treat all derived entries as always valid
-                  # Phase B: replace with real temporal ordering from partner ledger
+    if not session_order:
+        return True  # no ordering available — can't penalize
+    try:
+        after_idx   = session_order.index(valid_after)
+        current_idx = session_order.index(current_sid)
+        return current_idx >= after_idx
+    except ValueError:
+        return True  # unknown session ID — assume valid

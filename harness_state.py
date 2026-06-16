@@ -14,7 +14,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 
-from ledger import LedgerEntry, score_write_against_ledger, score_invalidate_against_ledger
+from ledger import LedgerEntry, _normalize, score_write_against_ledger, score_invalidate_against_ledger
 from memory_fs import VirtualFilesystem, _token_f1
 
 # ---------------------------------------------------------------------------
@@ -33,6 +33,14 @@ DIVERSITY_TARGET    = int(  os.environ.get("DIVERSITY_TARGET",    "4"))     # di
 _WRITE_OPS = {"STORE_FACT", "UPDATE", "SUPERSEDE", "COMPRESS"}
 # Ops that count toward diversity (not RESOLVE since that's always injected)
 _DIVERSITY_OPS = {"STORE_FACT", "UPDATE", "SUPERSEDE", "COMPRESS", "ABSTAIN", "RETRIEVE"}
+
+
+def _score_resolve(answer: str, gold: str) -> float:
+    """Route to exact match or token-F1 based on gold answer length."""
+    gold_tokens = _normalize(gold)
+    if len(gold_tokens) <= 3:
+        return 1.0 if _normalize(answer) == gold_tokens else 0.0
+    return _token_f1(answer, gold)
 
 
 # ---------------------------------------------------------------------------
@@ -156,8 +164,18 @@ class MemoryHarnessState:
     # ------------------------------------------------------------------
 
     def apply_resolve(self, answer: str, gold: str) -> float:
-        """Score a RESOLVE answer against the gold answer. Returns token-F1."""
-        score = _token_f1(answer, gold)
+        """Score a RESOLVE answer. Routes by gold answer type.
+
+        Short/categorical answers (≤3 content tokens after stop-word removal)
+        use exact match. Token-F1 on a single-word answer or a letter option
+        ("B", "Acupuncture") gives spurious partial credit when the model
+        hallucinates a different word that shares no tokens at all — F1 = 0 in
+        that case anyway — but partial overlap on 1-2 token answers can inflate
+        score when the answer is wrong (e.g. gold="2019", pred="late 2019" → F1
+        = 0.67 despite being wrong). Exact match is the right metric there.
+        Free-form answers (>3 tokens) keep F1 because partial recall matters.
+        """
+        score = _score_resolve(answer, gold)
         self.probe_scores.append(score)
         self.op_counts["RESOLVE"] += 1
         return score
