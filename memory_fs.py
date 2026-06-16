@@ -86,24 +86,46 @@ class VirtualFilesystem:
             self.files[path] = [tagged]
             self.importance[path] = "confirmed"
 
-    def seed_from_session(self, session: dict, session_idx: int) -> None:
+    def seed_from_session(self, session: dict, session_idx: int, max_turns: int = 5) -> None:
         """Auto-seed FS with key facts from a session (Harness-1 auto-populate analog).
 
         Called before the GRPO episode starts so the model has warm prior state
         rather than an empty FS — avoids cold-start reward collapse.
         All seeded entries are tagged tentative (model must confirm or supersede them).
+
+        Only seeds substantive user turns (skips filler, greetings, short turns).
+        Capped at max_turns to avoid polluting FS with noise.
         """
-        turns = session.get("turns", [])
+        _FILLER = {"hi", "hello", "hey", "thanks", "thank you", "ok", "okay",
+                   "sure", "yes", "no", "bye", "goodbye", "lol", "haha", "got it"}
+
+        turns   = session.get("turns", [])
+        seeded  = 0
+
+        # Score turns by informativeness: length + proper noun count
+        scored = []
         for t_idx, turn in enumerate(turns):
             content = turn.get("content", "").strip()
-            if not content or len(content) < 20:
+            role    = turn.get("role", "user")
+            if not content or len(content) < 40:
                 continue
-            # Heuristic: try to assign a sensible path from content keywords
-            path = _infer_path(content)
-            tagged = f"{content[:120]} [s={session_idx} t={t_idx} auto]"
+            words_lower = set(content.lower().split())
+            if words_lower & _FILLER and len(content) < 80:
+                continue  # skip short filler turns
+            # score = content length + 5 per proper noun
+            proper_count = sum(1 for w in content.split() if w and w[0].isupper() and len(w) > 2)
+            score = len(content) + 5 * proper_count
+            scored.append((score, t_idx, content))
+
+        # Take top-max_turns most informative turns
+        scored.sort(reverse=True)
+        for score, t_idx, content in scored[:max_turns]:
+            path   = _infer_path(content)
+            tagged = f"{content[:100]} [s={session_idx} t={t_idx} auto]"
             self.files.setdefault(path, []).append(tagged)
             if self.importance.get(path) != "confirmed":
                 self.importance[path] = "tentative"
+            seeded += 1
 
     def render_for_prompt(self) -> str:
         """Return a compact text block for prompt injection, ordered by importance."""

@@ -28,7 +28,7 @@ OP_PENALTY_ONSET    = int(  os.environ.get("OP_PENALTY_ONSET",    "20"))    # op
 FORMAT_PENALTY      = float(os.environ.get("FORMAT_PENALTY",      "-0.5"))  # per invalid op
 ABSTAIN_PENALTY     = float(os.environ.get("ABSTAIN_PENALTY",     "-0.3"))  # over-abstention on probe
 DIVERSITY_BONUS     = float(os.environ.get("DIVERSITY_BONUS",     "0.10"))  # bonus for using ≥N distinct ops
-DIVERSITY_TARGET    = int(  os.environ.get("DIVERSITY_TARGET",    "3"))     # distinct op types to earn bonus
+DIVERSITY_TARGET    = int(  os.environ.get("DIVERSITY_TARGET",    "4"))     # distinct op types to earn bonus (4 forces real mixing)
 
 _WRITE_OPS = {"STORE_FACT", "UPDATE", "SUPERSEDE", "COMPRESS"}
 # Ops that count toward diversity (not RESOLVE since that's always injected)
