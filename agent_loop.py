@@ -47,7 +47,12 @@ _SYSTEM_PROMPT = """\
 You are a memory manager for a long-running conversational AI.
 As each conversation turn arrives, decide what to store, update, retrieve, or compress.
 
-Your memory is a filesystem of category paths:
+Your memory is a filesystem of category paths. Each path has an importance tag:
+  [CONFIRMED]  — verified by multiple writes or an explicit UPDATE/SUPERSEDE
+  [TENTATIVE]  — initial STORE_FACT (may be overwritten later)
+  [SUPERSEDED] — replaced; kept for audit only
+
+Categories:
   people/   — facts about individuals
   events/   — past and future events
   places/   — locations and addresses
@@ -56,19 +61,24 @@ Your memory is a filesystem of category paths:
 
 Output a single JSON object (no explanation):
 
-Write ops (modify the filesystem):
-  {"op": "STORE_FACT",  "path": "category/entity", "content": "what to store"}
-  {"op": "UPDATE",      "path": "category/entity", "content": "updated value"}
-  {"op": "SUPERSEDE",   "path": "category/entity", "content": "new value replacing all prior"}
-  {"op": "COMPRESS",    "path": "category/entity", "content": "summary of this path"}
+Write ops:
+  {"op": "STORE_FACT",  "path": "category/entity", "content": "what to store"}       → tentative
+  {"op": "UPDATE",      "path": "category/entity", "content": "updated value"}        → promotes to confirmed
+  {"op": "SUPERSEDE",   "path": "category/entity", "content": "new value replacing all prior"} → confirmed
+  {"op": "COMPRESS",    "path": "category/entity", "content": "summary of this path"} → confirmed
   {"op": "ABSTAIN"}
 
-Retrieval op (search your memory before writing or answering):
+Retrieval op:
   {"op": "RETRIEVE", "query": "what you want to look up"}
-  The harness will return relevant entries from your memory.
+  The harness returns relevant entries. Use this before answering probe questions.
 
 Answer op (only when asked a probe question):
   {"op": "RESOLVE", "content": "your answer based on retrieved memory"}
+
+Rules:
+- Use UPDATE or SUPERSEDE (not STORE_FACT) when correcting something already stored.
+- RETRIEVE before RESOLVE — check your memory before answering.
+- Mix your op types; do not ABSTAIN on everything.
 /nothink"""
 
 
@@ -270,11 +280,19 @@ class MemoryAgentLoop:
         ledger  = derive_ledger(qa_probes, sessions)
         harness = MemoryHarnessState(ledger=ledger)
 
+        # Auto-seed FS from prior sessions (Harness-1 warm-start analog).
+        # Avoids cold-start reward collapse: rollouts start with non-empty FS
+        # so reward variance exists from step 1 and GRPO gradient flows immediately.
+        session_idx = extra.get("first_turn", {}).get("session_idx", 0)
+        if session_idx > 0 and sessions:
+            harness.seed_from_sessions(sessions, seed_session_count=session_idx)
+        elif sessions:
+            harness.seed_from_sessions(sessions, seed_session_count=1)
+
         all_prompt_ids   = []
         all_resp_ids     = []
         all_resp_mask    = []
         all_responses    = []
-        session_idx      = extra.get("first_turn", {}).get("session_idx", 0)
         turn_offset      = extra.get("first_turn", {}).get("turn_idx", 0)
         current_messages = list(messages)
 

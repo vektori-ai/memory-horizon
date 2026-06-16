@@ -39,7 +39,12 @@ You are an expert memory manager for a long-running conversational AI.
 Given the current memory filesystem state and a new conversation turn,
 output the single best memory operation as a JSON object.
 
-Memory filesystem paths:
+Memory filesystem paths carry importance tags:
+  [CONFIRMED]  — written by UPDATE or SUPERSEDE; high confidence
+  [TENTATIVE]  — initial STORE_FACT; may be overwritten
+  [SUPERSEDED] — replaced fact; low weight
+
+Categories:
   people/   — facts about individuals
   events/   — past and future events
   places/   — locations and addresses
@@ -49,18 +54,19 @@ Memory filesystem paths:
 Output exactly one JSON object, nothing else:
 
 Write ops:
-  {"op": "STORE_FACT",  "path": "category/entity", "content": "concise fact to store"}
-  {"op": "UPDATE",      "path": "category/entity", "content": "updated value"}
-  {"op": "SUPERSEDE",   "path": "category/entity", "content": "new value that replaces all prior"}
-  {"op": "COMPRESS",    "path": "category/entity", "content": "summary replacing verbose entries"}
+  {"op": "STORE_FACT",  "path": "category/entity", "content": "concise fact"}       → tentative
+  {"op": "UPDATE",      "path": "category/entity", "content": "updated value"}       → confirmed
+  {"op": "SUPERSEDE",   "path": "category/entity", "content": "replaces all prior"}  → confirmed
+  {"op": "COMPRESS",    "path": "category/entity", "content": "summary of path"}     → confirmed
   {"op": "ABSTAIN"}
 
-Retrieval op (when you need to check memory before deciding):
+Retrieval op:
   {"op": "RETRIEVE", "query": "what to look up"}
 
 Rules:
 - Use SUPERSEDE when a fact directly contradicts something previously stored.
 - Use UPDATE when a fact refines or extends something stored.
+- Prefer UPDATE/SUPERSEDE over STORE_FACT when the path already has content.
 - Use ABSTAIN when the turn contains no storable information (greetings, filler, etc).
 - Keep content concise — one sentence max.
 - path must be category/entity (e.g. people/alice, facts/payment_plan).
@@ -100,27 +106,51 @@ def _parse_json(text: str) -> dict | None:
 
 
 # ── Simple VirtualFilesystem for SFT generation (no verl dependency) ────────
+# Mirrors memory_fs.VirtualFilesystem with importance tags so the rendered state
+# the teacher sees during SFT generation matches what the trained model sees at RL time.
 
 class _FS:
     def __init__(self):
-        self.files: dict[str, list[str]] = {}
+        self.files:      dict[str, list[str]] = {}
+        self.importance: dict[str, str]       = {}  # tentative / confirmed / superseded
 
     def apply(self, op: dict) -> None:
-        t = op.get("op", "")
-        path = op.get("path", "").strip()
+        t       = op.get("op", "")
+        path    = op.get("path", "").strip()
         content = op.get("content", "").strip()
-        if t in ("UPDATE", "SUPERSEDE", "COMPRESS") and path and content:
-            self.files[path] = [content]
-        elif t == "STORE_FACT" and path and content:
+        if not path or not content:
+            return
+        if t == "STORE_FACT":
             self.files.setdefault(path, []).append(content)
+            if self.importance.get(path) != "confirmed":
+                self.importance[path] = "tentative"
+        elif t == "UPDATE":
+            self.files.setdefault(path, []).append(content)
+            self.importance[path] = "confirmed"
+        elif t in ("SUPERSEDE", "COMPRESS"):
+            prior = self.files.get(path)
+            if prior:
+                self.files[f"{path}_prior"] = prior
+                self.importance[f"{path}_prior"] = "superseded"
+            self.files[path] = [content]
+            self.importance[path] = "confirmed"
 
     def render(self) -> str:
         if not self.files:
             return "(memory is empty)"
-        lines = []
+        groups: dict[str, list[str]] = {"confirmed": [], "tentative": [], "superseded": []}
         for path in sorted(self.files):
-            lines.append(f"=== {path} ===")
-            lines.extend(self.files[path])
+            tag = self.importance.get(path, "tentative")
+            groups[tag].append(path)
+        lines = []
+        for tag in ("confirmed", "tentative", "superseded"):
+            paths = groups[tag]
+            if not paths:
+                continue
+            lines.append(f"[{tag.upper()}]")
+            for path in paths:
+                lines.append(f"  === {path} ===")
+                lines.extend(f"  {l}" for l in self.files[path])
         return "\n".join(lines)
 
 

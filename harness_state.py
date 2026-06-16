@@ -27,8 +27,12 @@ OP_PENALTY_MAX      = float(os.environ.get("OP_PENALTY_MAX",      "0.15"))  # ma
 OP_PENALTY_ONSET    = int(  os.environ.get("OP_PENALTY_ONSET",    "20"))    # ops before penalty starts
 FORMAT_PENALTY      = float(os.environ.get("FORMAT_PENALTY",      "-0.5"))  # per invalid op
 ABSTAIN_PENALTY     = float(os.environ.get("ABSTAIN_PENALTY",     "-0.3"))  # over-abstention on probe
+DIVERSITY_BONUS     = float(os.environ.get("DIVERSITY_BONUS",     "0.10"))  # bonus for using ≥N distinct ops
+DIVERSITY_TARGET    = int(  os.environ.get("DIVERSITY_TARGET",    "3"))     # distinct op types to earn bonus
 
 _WRITE_OPS = {"STORE_FACT", "UPDATE", "SUPERSEDE", "COMPRESS"}
+# Ops that count toward diversity (not RESOLVE since that's always injected)
+_DIVERSITY_OPS = {"STORE_FACT", "UPDATE", "SUPERSEDE", "COMPRESS", "ABSTAIN", "RETRIEVE"}
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +44,7 @@ class MemoryHarnessState:
     """Full episode state for one rollout window.
 
     Attributes:
-        fs:              The VirtualFilesystem — agent's memory store.
+        fs:              The VirtualFilesystem — agent's memory store (with importance tags).
         ledger:          Ground-truth fact entries for step-level reward.
         retrieval_log:   Each RETRIEVE call: {turn, query, results}.
         op_counts:       Counter of op types issued (including INVALID).
@@ -55,6 +59,21 @@ class MemoryHarnessState:
     step_rewards:    list[float]                = field(default_factory=list)
     probe_scores:    list[float]                = field(default_factory=list)
     current_session: str | None                 = None
+
+    # ------------------------------------------------------------------
+    # Auto-seeding (Harness-1 warm-start analog)
+    # ------------------------------------------------------------------
+
+    def seed_from_sessions(self, sessions: list[dict], seed_session_count: int = 1) -> None:
+        """Pre-populate FS from the first N sessions before the episode starts.
+
+        Avoids cold-start reward collapse: early GRPO rollouts start with warm
+        prior state so reward variance exists from step 1. All seeded entries
+        are tagged 'tentative' — the model must confirm or supersede them.
+        Mirrors Harness-1's auto_populate_from_first_search.
+        """
+        for s_idx in range(min(seed_session_count, len(sessions))):
+            self.fs.seed_from_session(sessions[s_idx], session_idx=s_idx)
 
     # ------------------------------------------------------------------
     # Apply an op and score it against the ledger
@@ -124,13 +143,17 @@ class MemoryHarnessState:
     def compute_reward(self) -> float:
         """Compute final episode reward.
 
-        reward = RESOLVE_WEIGHT  * mean(probe_scores)
-               + STEP_WEIGHT     * mean(step_rewards)
-               - op_penalty
-               + format_penalty  (already baked into step_rewards as FORMAT_PENALTY)
+        reward = RESOLVE_WEIGHT    * mean(probe_scores)
+               + STEP_WEIGHT       * mean(positive_step_rewards)
+               + diversity_bonus   (if ≥ DIVERSITY_TARGET distinct op types used)
+               - op_penalty        (linear ramp after OP_PENALTY_ONSET ops)
+               + abstain_penalty   (negative, applied if probes exist but 0 RESOLVE)
 
-        Mirrors harness-1's compute_reward in ultra_core.py:
-          outcome_weight * curated_recall + trajectory_weight * pool_recall - turn_penalty
+        Mirrors harness-1's reward:
+          outcome_weight * curated_recall
+          + trajectory_weight * pool_recall
+          + tool_diversity_bonus
+          - turn_penalty
         """
         resolve_score = (
             sum(self.probe_scores) / len(self.probe_scores)
@@ -153,9 +176,16 @@ class MemoryHarnessState:
         else:
             abstain_penalty = 0.0
 
+        # Tool-diversity bonus — incentivize mixing op types (Harness-1 Fig 5 lesson)
+        distinct_ops = sum(
+            1 for op in _DIVERSITY_OPS if self.op_counts.get(op, 0) > 0
+        )
+        diversity_bonus = DIVERSITY_BONUS if distinct_ops >= DIVERSITY_TARGET else 0.0
+
         reward = (
-            RESOLVE_WEIGHT     * resolve_score
+            RESOLVE_WEIGHT       * resolve_score
             + STEP_REWARD_WEIGHT * step_score
+            + diversity_bonus
             - op_penalty
             + abstain_penalty
         )
@@ -166,6 +196,7 @@ class MemoryHarnessState:
     # ------------------------------------------------------------------
 
     def summary(self) -> dict[str, Any]:
+        distinct_ops = sum(1 for op in _DIVERSITY_OPS if self.op_counts.get(op, 0) > 0)
         return {
             "probe_scores":    self.probe_scores,
             "mean_resolve":    sum(self.probe_scores) / max(len(self.probe_scores), 1),
@@ -174,6 +205,10 @@ class MemoryHarnessState:
             "op_counts":       dict(self.op_counts),
             "n_retrievals":    len(self.retrieval_log),
             "fs_paths":        list(self.fs.files.keys()),
+            "n_confirmed":     sum(1 for t in self.fs.importance.values() if t == "confirmed"),
+            "n_tentative":     sum(1 for t in self.fs.importance.values() if t == "tentative"),
+            "distinct_ops":    distinct_ops,
+            "diversity_bonus": DIVERSITY_BONUS if distinct_ops >= DIVERSITY_TARGET else 0.0,
             "final_reward":    self.compute_reward(),
         }
 
