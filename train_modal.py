@@ -168,22 +168,34 @@ def sft(sft_jsonl: str, run_name: str = "sft_warmup", n_epochs: int = 1) -> dict
         def __init__(self, traces: list[dict], tokenizer, max_len: int = 1024):
             self.tokenizer = tokenizer
             self.max_len   = max_len
-            self.examples  = []
+            self.examples  = []   # (full_text, prompt_len_in_tokens)
             for t in traces:
                 msgs = t.get("messages", [])
                 if not msgs:
                     continue
-                text = tokenizer.apply_chat_template(
+                full_text = tokenizer.apply_chat_template(
                     msgs, tokenize=False, add_generation_prompt=False
                 )
-                self.examples.append(text)
+                # Prompt-only portion (system + user), rendered the way it'd look
+                # right before generation starts — used only to measure how many
+                # leading tokens to mask out of the loss below. Tokenizing this
+                # substring separately and trusting its length as the prefix
+                # boundary is an approximation (BPE merges can occasionally
+                # differ right at the boundary) but is the standard approach
+                # used for this kind of completion-only masking.
+                prompt_text = tokenizer.apply_chat_template(
+                    msgs[:-1], tokenize=False, add_generation_prompt=True
+                )
+                prompt_len = len(tokenizer(prompt_text, add_special_tokens=False)["input_ids"])
+                self.examples.append((full_text, prompt_len))
 
         def __len__(self):
             return len(self.examples)
 
         def __getitem__(self, idx):
+            full_text, prompt_len = self.examples[idx]
             enc = self.tokenizer(
-                self.examples[idx],
+                full_text,
                 max_length=self.max_len,
                 truncation=True,
                 padding="max_length",
@@ -191,8 +203,14 @@ def sft(sft_jsonl: str, run_name: str = "sft_warmup", n_epochs: int = 1) -> dict
             )
             ids    = enc["input_ids"].squeeze()
             labels = ids.clone()
-            # mask padding
             labels[labels == self.tokenizer.pad_token_id] = -100
+            # Mask the system+user prompt tokens too — previously the loss ran
+            # over the ENTIRE sequence, including the rendered [Memory state]/
+            # turn text the model is just being shown, not asked to produce.
+            # Only the assistant's JSON completion should contribute to the
+            # gradient; that's the one thing SFT is actually meant to teach here.
+            mask_len = min(prompt_len, labels.shape[0])
+            labels[:mask_len] = -100
             return {"input_ids": ids, "attention_mask": enc["attention_mask"].squeeze(), "labels": labels}
 
     traces = [_json.loads(l) for l in sft_jsonl.strip().split("\n") if l.strip()]
@@ -235,9 +253,27 @@ def sft(sft_jsonl: str, run_name: str = "sft_warmup", n_epochs: int = 1) -> dict
 
     model.save_pretrained(ckpt_dir)
     tokenizer.save_pretrained(ckpt_dir)
+
+    # verl 0.5.0 has no LoRA-adapter resume path (lora_adapter_path landed in
+    # PR #3523, merged 2025-10-28 — three months after the 0.5.0 release this
+    # repo is pinned to; confirmed via PyPI's release date + the GitHub PR, not
+    # assumed). The only way GRPO can actually start from this SFT checkpoint at
+    # this verl version is from a full merged model, not the bare adapter dir —
+    # train()'s base_model_path should point here, not at MODEL_ID, to use it.
+    merged_dir = str(MODELS_PATH / f"{run_name}_merged")
+    merged_model = model.merge_and_unload()
+    merged_model.save_pretrained(merged_dir)
+    tokenizer.save_pretrained(merged_dir)
+
     checkpoints_volume.commit()
-    print(f"[sft] checkpoint saved → {ckpt_dir}")
-    return {"run_name": run_name, "n_traces": len(traces), "checkpoint": ckpt_dir}
+    print(f"[sft] adapter checkpoint → {ckpt_dir}")
+    print(f"[sft] merged checkpoint  → {merged_dir}  (pass this to train(base_model_path=...))")
+    return {
+        "run_name":          run_name,
+        "n_traces":          len(traces),
+        "checkpoint":        ckpt_dir,
+        "merged_checkpoint": merged_dir,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +291,12 @@ def sft(sft_jsonl: str, run_name: str = "sft_warmup", n_epochs: int = 1) -> dict
     },
     secrets=[modal.Secret.from_name("huggingface-secret"), modal.Secret.from_name("wandb-secret")],
 )
-def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS) -> dict:
+def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS, base_model_path: str = MODEL_ID) -> dict:
+    """base_model_path: defaults to the raw base model. Pass sft()'s returned
+    "merged_checkpoint" path here to actually warm-start GRPO from the SFT run —
+    previously this was always MODEL_ID regardless of whether sft() had been run,
+    so run_sft()'s claimed "GRPO resumes from the SFT checkpoint" never happened.
+    """
     data_volume.reload()
 
     cmd = [
@@ -272,7 +313,7 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS) -> dict:
         "data.filter_overlong_prompts=True",
         "data.truncation=right",
         # model + LoRA (cuts optimizer states from 32 GB → ~320 MB)
-        f"actor_rollout_ref.model.path={MODEL_ID}",
+        f"actor_rollout_ref.model.path={base_model_path}",
         "actor_rollout_ref.model.use_remove_padding=True",
         "actor_rollout_ref.model.enable_gradient_checkpointing=True",
         "actor_rollout_ref.model.lora_rank=32",
@@ -512,10 +553,19 @@ def sanity():
 
 
 @app.local_entrypoint()
-def train_only():
-    """Train using existing parquet on the data volume (skips data prep)."""
+def train_only(base_model_path: str = ""):
+    """Train using existing parquet on the data volume (skips data prep).
+
+    Pass base_model_path=<sft()'s merged_checkpoint> (printed by run_sft below)
+    to actually warm-start from the SFT run instead of the raw base model:
+        modal run train_modal.py::train_only --base-model-path /models/sft_warmup_merged
+    """
     print("Starting GRPO training...")
-    result = train.remote(run_name="locomo_lme_run_002")
+    kwargs = {"run_name": "locomo_lme_run_002"}
+    if base_model_path:
+        kwargs["base_model_path"] = base_model_path
+        print(f"Warm-starting from SFT checkpoint: {base_model_path}")
+    result = train.remote(**kwargs)
     print("Done:", result)
 
 
@@ -624,8 +674,9 @@ def run_sft():
         2. export OPENAI_API_KEY=sk-...
         3. modal run train_modal.py::run_sft
 
-    After this completes, run GRPO warm-started from the SFT checkpoint:
-        modal run train_modal.py::train_only
+    After this completes, run GRPO warm-started from the SFT checkpoint (the
+    exact command, with the merged checkpoint path filled in, is printed below):
+        modal run train_modal.py::train_only --base-model-path /models/sft_warmup_merged
     """
     import subprocess, os, sys
 
@@ -661,7 +712,12 @@ def run_sft():
     print(f"Uploading {n_traces} traces to Modal and starting SFT ...")
     result = sft.remote(sft_jsonl=sft_jsonl, run_name="sft_warmup", n_epochs=1)
     print("SFT done:", result)
-    print("\nNext: modal run train_modal.py::train_only")
+    # train_only previously always trained from the raw base model regardless
+    # of whether SFT had run — pass the merged checkpoint explicitly to
+    # actually use it (verl 0.5.0 can't resume from a bare LoRA adapter dir,
+    # see sft()'s comment on lora_adapter_path).
+    merged = result.get("merged_checkpoint", "")
+    print(f"\nNext: modal run train_modal.py::train_only --base-model-path {merged}")
 
 
 # ---------------------------------------------------------------------------

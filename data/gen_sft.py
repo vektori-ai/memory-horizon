@@ -26,51 +26,20 @@ from pathlib import Path
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
+from agent_loop import _SYSTEM_PROMPT  # noqa: E402 (import after sys.path tweak)
+
 DATA = ROOT / "data"
 DEFAULT_OUT = DATA / "sft_traces.jsonl"
 
 MODEL = "gpt-oss-120b"   # OpenAI GPT-OSS 120B
 
-# ── System prompt for the strong model ──────────────────────────────────────
-# Same schema our Qwen3-8B will be trained on.
-
-_SFT_SYSTEM = """\
-You are an expert memory manager for a long-running conversational AI.
-Given the current memory filesystem state and a new conversation turn,
-output the single best memory operation as a JSON object.
-
-Memory filesystem paths carry importance tags:
-  [CONFIRMED]  — written by UPDATE or SUPERSEDE; high confidence
-  [TENTATIVE]  — initial STORE_FACT; may be overwritten
-  [SUPERSEDED] — replaced fact; low weight
-
-Categories:
-  people/   — facts about individuals
-  events/   — past and future events
-  places/   — locations and addresses
-  facts/    — general facts and context
-  prefs/    — preferences and habits
-
-Output exactly one JSON object, nothing else:
-
-Write ops:
-  {"op": "STORE_FACT",  "path": "category/entity", "content": "concise fact"}       → tentative
-  {"op": "UPDATE",      "path": "category/entity", "content": "updated value"}       → confirmed
-  {"op": "SUPERSEDE",   "path": "category/entity", "content": "replaces all prior"}  → confirmed
-  {"op": "COMPRESS",    "path": "category/entity", "content": "summary of path"}     → confirmed
-  {"op": "ABSTAIN"}
-
-Retrieval op:
-  {"op": "RETRIEVE", "query": "what to look up"}
-
-Rules:
-- Use SUPERSEDE when a fact directly contradicts something previously stored.
-- Use UPDATE when a fact refines or extends something stored.
-- Prefer UPDATE/SUPERSEDE over STORE_FACT when the path already has content.
-- Use ABSTAIN when the turn contains no storable information (greetings, filler, etc).
-- Keep content concise — one sentence max.
-- path must be category/entity (e.g. people/alice, facts/payment_plan).
-"""
+# Teacher uses the EXACT same system prompt as the RL policy (agent_loop.py).
+# Used to keep a hand-duplicated copy here that had drifted from the real one —
+# missing the RESOLVE op, the /nothink suffix, and the "mix your op types"
+# instruction — meaning the SFT warm-start was conditioning the model on a
+# subtly different prompt than what it'd see once GRPO started. Importing
+# directly instead of redefining means this can't drift again.
+_SFT_SYSTEM = _SYSTEM_PROMPT
 
 
 def _make_user_prompt(fs_state: str, turn_text: str) -> str:
