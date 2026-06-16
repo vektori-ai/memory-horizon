@@ -1,0 +1,17 @@
+# verl v0.5.0 agent-loop registry file.
+#
+# verl has no `agent_loop_cls` config key (that string never existed in this
+# version — confirmed against verl/experimental/agent_loop/agent_loop.py at the
+# v0.5.0 tag). Custom agent loops are selected per-row via
+# batch.non_tensor_batch["agent_name"] (see agent_loop.py::build_verl_batch,
+# which stamps "agent_name": "memory_agent" onto every row), looked up in a
+# registry populated either by the @register("name") decorator at import time
+# or by loading this file via:
+#   actor_rollout_ref.rollout.agent.agent_loop_config_path=/root/agent_loop_config.yaml
+#
+# agent_loop.py already applies @register("memory_agent") itself when verl is
+# importable, so this file is technically redundant with that — kept anyway as
+# the explicit, config-driven registration path in case import-time
+# registration order ever doesn't run before the registry lookup.
+- name: memory_agent
+  _target_: agent_loop.MemoryAgentLoop

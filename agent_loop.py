@@ -26,6 +26,7 @@ Architecture mirrors harness-1:
 from __future__ import annotations
 
 import json
+import uuid
 from collections import Counter
 from typing import TYPE_CHECKING
 
@@ -201,6 +202,10 @@ def build_verl_batch(
                 "data_source":  vertical,
                 "prompt":       prompt,
                 "ability":      "memory_management",
+                # Top-level (not nested in extra_info) — verl reads this straight
+                # into batch.non_tensor_batch["agent_name"] to route the row to
+                # MemoryAgentLoop instead of the default single_turn_agent loop.
+                "agent_name":   "memory_agent",
                 "reward_model": {"ground_truth": json.dumps(scoreable)},
                 "extra_info": {
                     "trajectory_id":      traj_id,
@@ -227,19 +232,37 @@ def build_verl_batch(
 # ---------------------------------------------------------------------------
 
 def _get_agent_loop_base():
-    """Lazy import of verl's AgentLoopBase to keep this file importable locally."""
+    """Lazy import of verl's AgentLoopBase to keep this file importable locally.
+
+    Real module at verl v0.5.0 is verl.experimental.agent_loop.agent_loop —
+    verl.trainer.ppo.agent_loop (the path this used to import from) does not
+    exist at this pin (404 at the v0.5.0 tag); that import always failed
+    silently and fell back to (None, None), even inside the Modal container
+    where verl is installed.
+    """
     try:
-        from verl.trainer.ppo.agent_loop import AgentLoopBase, AgentLoopOutput
-        return AgentLoopBase, AgentLoopOutput
+        from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
+        return AgentLoopBase, AgentLoopOutput, register
     except ImportError:
-        return None, None
+        return None, None, None
 
 
-class MemoryAgentLoop:
+_AgentLoopBase, _AgentLoopOutput, _register = _get_agent_loop_base()
+_MemoryAgentLoopBase = _AgentLoopBase if _AgentLoopBase is not None else object
+
+
+class MemoryAgentLoop(_MemoryAgentLoopBase):
     """verl v0.5.0 AgentLoop implementation for multi-turn memory management.
 
-    Registered with verl via train_modal.py config:
-        actor_rollout_ref.rollout.agent_loop_cls=agent_loop.MemoryAgentLoop
+    Registered with verl via a YAML registry (verl v0.5.0 has no agent_loop_cls
+    config key — it selects loops per-row via batch.non_tensor_batch["agent_name"],
+    looked up in a registry populated from actor_rollout_ref.rollout.agent.agent_loop_config_path):
+        # agent_loop_config.yaml
+        - name: memory_agent
+          _target_: agent_loop.MemoryAgentLoop
+    Rows must carry a top-level "agent_name": "memory_agent" field (see
+    build_verl_batch below) so verl routes them here instead of the default
+    single_turn_agent loop.
 
     For each episode window:
       1. Model generates op for turn 0 (from initial prompt in the data row).
@@ -250,14 +273,8 @@ class MemoryAgentLoop:
       6. Returns AgentLoopOutput: prompt_ids, response_ids, response_mask.
     """
 
-    def __init_subclass_hook__(cls):
-        AgentLoopBase, _ = _get_agent_loop_base()
-        if AgentLoopBase is not None:
-            cls.__bases__ = (AgentLoopBase,)
-
     async def run(self, messages: list[dict], sampling_params: dict):
-        AgentLoopBase, AgentLoopOutput = _get_agent_loop_base()
-        if AgentLoopBase is None:
+        if _AgentLoopBase is None:
             raise ImportError("verl not installed — MemoryAgentLoop requires verl v0.5.0")
 
         extra        = sampling_params.get("extra_info", {})
@@ -298,11 +315,21 @@ class MemoryAgentLoop:
 
         # ── Conversation turns phase ───────────────────────────────────────
         for step_idx in range(1 + len(rest_turns)):
-            step_prompt_ids = self.tokenize(current_messages)
+            # AgentLoopBase doesn't expose a self.tokenize()/self.generate() convenience
+            # API (verified against verl's own SingleTurnAgentLoop/ToolAgentLoop) — real
+            # subclasses go through self.tokenizer / self.server_manager directly.
+            step_prompt_ids = self.tokenizer.apply_chat_template(
+                current_messages, add_generation_prompt=True, tokenize=True
+            )
             if step_idx == 0:
                 all_prompt_ids = step_prompt_ids
 
-            response_ids, response_text = await self.generate(step_prompt_ids, sampling_params)
+            response_ids = await self.server_manager.generate(
+                request_id=uuid.uuid4().hex,
+                prompt_ids=step_prompt_ids,
+                sampling_params=sampling_params,
+            )
+            response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
             all_responses.append(response_text)
             all_resp_ids  += response_ids
             all_resp_mask += [1] * len(response_ids)
@@ -320,7 +347,7 @@ class MemoryAgentLoop:
                     f"\n[Retrieved for: {query}]\n"
                     f"{results or '(no relevant entries found)'}"
                 )
-                ret_ids = self.tokenize_text(retrieve_obs)
+                ret_ids = self.tokenizer.encode(retrieve_obs, add_special_tokens=False)
                 all_resp_ids  += ret_ids
                 all_resp_mask += [0] * len(ret_ids)   # harness output, not trained on
                 current_messages = current_messages + [
@@ -337,7 +364,7 @@ class MemoryAgentLoop:
                         f"\n[Memory state]\n{harness.render_context()}\n\n"
                         f"[Next turn]\n{_format_turn(next_turn)}"
                     )
-                    obs_ids = self.tokenize_text(observation)
+                    obs_ids = self.tokenizer.encode(observation, add_special_tokens=False)
                     all_resp_ids  += obs_ids
                     all_resp_mask += [0] * len(obs_ids)
                     current_messages = current_messages + [
@@ -359,8 +386,15 @@ class MemoryAgentLoop:
                 f"[Question]\n{question}"
             )
             probe_messages   = current_messages + [{"role": "user", "content": probe_obs}]
-            probe_prompt_ids = self.tokenize(probe_messages)
-            resolve_ids, resolve_text = await self.generate(probe_prompt_ids, sampling_params)
+            probe_prompt_ids = self.tokenizer.apply_chat_template(
+                probe_messages, add_generation_prompt=True, tokenize=True
+            )
+            resolve_ids = await self.server_manager.generate(
+                request_id=uuid.uuid4().hex,
+                prompt_ids=probe_prompt_ids,
+                sampling_params=sampling_params,
+            )
+            resolve_text = self.tokenizer.decode(resolve_ids, skip_special_tokens=True)
 
             all_resp_ids  += resolve_ids
             all_resp_mask += [1] * len(resolve_ids)
@@ -374,29 +408,33 @@ class MemoryAgentLoop:
             )
             harness.apply_resolve(resolve_content, answer)
 
-        reward = harness.compute_reward()
+        # harness.summary() (below) computes harness.compute_reward() itself and logs
+        # it to WandB as episode/reward — purely diagnostic. Confirmed against verl
+        # v0.5.0 source (verl/experimental/agent_loop/agent_loop.py) and docs that
+        # AgentLoopOutput has no reward field: reward for agent-loop rollouts is
+        # always computed downstream by the reward manager calling
+        # custom_reward_function (reward.py::compute_reward) on the decoded response
+        # text, never returned from run(). reward.py independently replays this same
+        # transcript (replay_and_score) to recompute an equivalent score for the
+        # actual training signal — this method's return value never reaches verl.
         _log_episode_stats(all_responses, harness.summary())
 
-        return AgentLoopOutput(
+        # num_turns mirrors what verl's shipped SingleTurnAgentLoop/ToolAgentLoop both
+        # populate (informational/logging — write+retrieve steps plus probe steps).
+        num_turns = (1 + len(rest_turns)) + len(qa_probes)
+
+        return _AgentLoopOutput(
             prompt_ids    = all_prompt_ids,
             response_ids  = all_resp_ids,
             response_mask = all_resp_mask,
-            reward        = reward,
+            num_turns     = num_turns,
         )
 
-    # -- stubs filled in by verl's AgentLoopWorker at runtime --
 
-    async def generate(self, prompt_ids: list[int], sampling_params: dict):
-        """Generate response tokens. Implemented by verl AgentLoopBase."""
-        raise NotImplementedError
-
-    def tokenize(self, messages: list[dict]) -> list[int]:
-        """Tokenize a chat message list. Implemented by verl AgentLoopBase."""
-        raise NotImplementedError
-
-    def tokenize_text(self, text: str) -> list[int]:
-        """Tokenize a raw string. Implemented by verl AgentLoopBase."""
-        raise NotImplementedError
+# Register with verl's agent-loop registry so actor_rollout_ref.rollout.agent.agent_loop_config_path
+# can resolve "memory_agent" -> this class. No-op (and harmless) when verl isn't installed locally.
+if _register is not None:
+    MemoryAgentLoop = _register("memory_agent")(MemoryAgentLoop)
 
 
 # ---------------------------------------------------------------------------

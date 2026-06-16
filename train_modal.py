@@ -58,6 +58,7 @@ image = (
     .add_local_file(Path(__file__).parent / "ledger.py",            "/root/ledger.py",            copy=True)
     .add_local_file(Path(__file__).parent / "harness_state.py",     "/root/harness_state.py",     copy=True)
     .add_local_file(Path(__file__).parent / "agent_loop.py",        "/root/agent_loop.py",        copy=True)
+    .add_local_file(Path(__file__).parent / "agent_loop_config.yaml", "/root/agent_loop_config.yaml", copy=True)
     .add_local_file(Path(__file__).parent / "context1_service.py",  "/root/context1_service.py",  copy=True)
     .run_commands("python /root/patch_verl.py")
     .env({
@@ -299,10 +300,20 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS) -> dict:
         "actor_rollout_ref.rollout.multi_stage_wake_up=True",    # resume weights→state_dict→resume KV; prevents state_dict OOM when KV+weights+alloc all compete
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2",
         f"actor_rollout_ref.rollout.n={N_ROLLOUTS}",
-        # multi-turn AgentLoop
-        "+actor_rollout_ref.rollout.agent_loop_cls=agent_loop.MemoryAgentLoop",
-        "+actor_rollout_ref.rollout.max_turns=10",
-        "+actor_rollout_ref.rollout.single_response_max_tokens=256",
+        # multi-turn AgentLoop — mode=async is required: verl's AgentLoop registry/
+        # agent_name routing is only consulted under async rollout (default is
+        # "sync", which uses the plain SPMD path and ignores agent_name entirely —
+        # confirmed against verl/trainer/config/rollout/rollout.yaml at the v0.5.0
+        # tag). agent_loop_cls and max_turns/single_response_max_tokens below were
+        # never-real config keys (none of the three appear anywhere in verl's
+        # schema) — agent_name on each row (agent_loop.build_verl_batch) plus this
+        # YAML registry path are the actual mechanism.
+        "actor_rollout_ref.rollout.mode=async",
+        # no + prefix — agent.agent_loop_config_path is already in verl's default
+        # schema (rollout.yaml: agent.agent_loop_config_path, default null); this
+        # repo already hit the "+ on an existing key" hydra error twice before
+        # (985c35c, 27c4b42) for return_raw_chat and multi_stage_wake_up.
+        "actor_rollout_ref.rollout.agent.agent_loop_config_path=/root/agent_loop_config.yaml",
         # raw chat format required for AgentLoop
         "data.return_raw_chat=True",
         # ref model
