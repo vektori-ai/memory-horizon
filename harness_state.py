@@ -89,7 +89,22 @@ class MemoryHarnessState:
         self.op_counts[op_type] += 1
 
         if op_type == "INVALID" or not isinstance(op, dict):
+            # Used to return here without recording anything in step_rewards at
+            # all — meaning an invalid op had literally zero effect on the final
+            # reward (not even diluting the average), despite FORMAT_PENALTY
+            # existing. Now appended like every other step so compute_reward's
+            # step_score (which now sums everything, not just r > 0) can
+            # actually let this subtract.
+            self.step_rewards.append(FORMAT_PENALTY)
             return FORMAT_PENALTY
+
+        # SUPERSEDE archives whatever was at this path BEFORE the op is applied —
+        # capture it now. score_invalidate_against_ledger wants the content that
+        # just got archived (was it stale?), not the new content being written;
+        # fs.apply_op below overwrites self.fs.files[path], so this is the last
+        # point we can read the old value.
+        path          = op.get("path", "").strip()
+        prior_content = " ".join(self.fs.files.get(path, []))
 
         # Actually apply the op to the filesystem
         self.fs.apply_op(op, session_idx, turn_idx)
@@ -102,10 +117,13 @@ class MemoryHarnessState:
             step_r = score_write_against_ledger(
                 content, self.ledger, self.current_session
             )
-            # Extra signal for correctly superseding stale content
+            # Extra signal for correctly superseding stale content. Was passing
+            # `content` (the NEW value just written) here — backwards; the
+            # function scores whether the OLD value was stale, i.e. whether
+            # archiving it was the right call.
             if op_type == "SUPERSEDE":
                 step_r += score_invalidate_against_ledger(
-                    content, self.ledger, self.current_session
+                    prior_content, self.ledger, self.current_session
                 )
 
         self.step_rewards.append(step_r)
@@ -144,24 +162,29 @@ class MemoryHarnessState:
         """Compute final episode reward.
 
         reward = RESOLVE_WEIGHT    * mean(probe_scores)
-               + STEP_WEIGHT       * mean(positive_step_rewards)
-               + diversity_bonus   (if ≥ DIVERSITY_TARGET distinct op types used)
+               + STEP_WEIGHT       * mean(step_rewards)        # all of them, not just r > 0
+               + diversity_bonus   (smooth ramp toward DIVERSITY_TARGET distinct op types)
                - op_penalty        (linear ramp after OP_PENALTY_ONSET ops)
                + abstain_penalty   (negative, applied if probes exist but 0 RESOLVE)
 
-        Mirrors harness-1's reward:
+        Adapted from harness-1's reward (arXiv 2606.02373):
           outcome_weight * curated_recall
           + trajectory_weight * pool_recall
           + tool_diversity_bonus
           - turn_penalty
+        Not a literal mirror — see step_score and diversity_bonus comments below
+        for where this deliberately differs from a straight copy.
         """
         resolve_score = (
             sum(self.probe_scores) / len(self.probe_scores)
             if self.probe_scores else 0.0
         )
-        step_score = (
-            sum(r for r in self.step_rewards if r > 0) / max(len(self.step_rewards), 1)
-        )
+        # Used to only sum step_rewards where r > 0 — meaning FORMAT_PENALTY
+        # (-0.5, see apply_op) could never actually subtract from the episode
+        # reward, only dilute the average via denominator inflation. Sum
+        # everything now so invalid ops actually cost something, matching the
+        # documented per-step penalty table instead of silently no-op'ing it.
+        step_score = sum(self.step_rewards) / max(len(self.step_rewards), 1)
 
         # Op-count penalty — linear ramp (mirrors harness-1's turn penalty)
         total_ops = sum(self.op_counts[k] for k in self.op_counts if k != "RESOLVE")
@@ -176,11 +199,17 @@ class MemoryHarnessState:
         else:
             abstain_penalty = 0.0
 
-        # Tool-diversity bonus — incentivize mixing op types (Harness-1 Fig 5 lesson)
-        distinct_ops = sum(
-            1 for op in _DIVERSITY_OPS if self.op_counts.get(op, 0) > 0
-        )
-        diversity_bonus = DIVERSITY_BONUS if distinct_ops >= DIVERSITY_TARGET else 0.0
+        # Tool-diversity bonus — incentivize mixing op types (Harness-1 Fig 5 lesson:
+        # without this, RL collapses to a narrow search-only/single-op strategy).
+        # Used to be a step function (0 below DIVERSITY_TARGET, flat DIVERSITY_BONUS
+        # at/above it) — a hard cliff right at the threshold, which is exactly why
+        # DIVERSITY_TARGET needed reactive retuning (3→4, see eval_local.py commit:
+        # random policies earned the full bonus 90% of the time at 3). Harness-1's
+        # actual formula (arXiv 2606.02373 reward section) is a smooth ramp,
+        # w_div * min(ν/ν0, 1) — partial diversity earns proportional credit, no
+        # single threshold to find and farm.
+        distinct_ops    = sum(1 for op in _DIVERSITY_OPS if self.op_counts.get(op, 0) > 0)
+        diversity_bonus = DIVERSITY_BONUS * min(distinct_ops / DIVERSITY_TARGET, 1.0)
 
         reward = (
             RESOLVE_WEIGHT       * resolve_score
@@ -208,7 +237,7 @@ class MemoryHarnessState:
             "n_confirmed":     sum(1 for t in self.fs.importance.values() if t == "confirmed"),
             "n_tentative":     sum(1 for t in self.fs.importance.values() if t == "tentative"),
             "distinct_ops":    distinct_ops,
-            "diversity_bonus": DIVERSITY_BONUS if distinct_ops >= DIVERSITY_TARGET else 0.0,
+            "diversity_bonus": DIVERSITY_BONUS * min(distinct_ops / DIVERSITY_TARGET, 1.0),
             "final_reward":    self.compute_reward(),
         }
 
