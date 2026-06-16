@@ -297,7 +297,9 @@ class MemoryAgentLoop(_MemoryAgentLoopBase):
         ledger  = derive_ledger(qa_probes, sessions)
         harness = MemoryHarnessState(ledger=ledger)
 
-        # Auto-seed FS from prior sessions (Harness-1 warm-start analog).
+        # Auto-seed FS from prior sessions (adapted from Harness-1's warm-start
+        # idea — see MemoryHarnessState.seed_from_sessions docstring for why
+        # the trigger condition deliberately differs, not a literal mirror).
         # Avoids cold-start reward collapse: rollouts start with non-empty FS
         # so reward variance exists from step 1 and GRPO gradient flows immediately.
         session_idx = extra.get("first_turn", {}).get("session_idx", 0)

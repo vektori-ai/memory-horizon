@@ -61,7 +61,8 @@ class MemoryHarnessState:
     current_session: str | None                 = None
 
     # ------------------------------------------------------------------
-    # Auto-seeding (Harness-1 warm-start analog)
+    # Auto-seeding (adapted from Harness-1's warm-start idea, not the same
+    # trigger — see docstring)
     # ------------------------------------------------------------------
 
     def seed_from_sessions(self, sessions: list[dict], seed_session_count: int = 1) -> None:
@@ -70,7 +71,14 @@ class MemoryHarnessState:
         Avoids cold-start reward collapse: early GRPO rollouts start with warm
         prior state so reward variance exists from step 1. All seeded entries
         are tagged 'tentative' — the model must confirm or supersede them.
-        Mirrors Harness-1's auto_populate_from_first_search.
+
+        Adapted from Harness-1's auto_populate_from_first_search, not a literal
+        mirror: Harness-1 seeds only after the policy's own first successful
+        search action (still earned by a real decision); this seeds
+        unconditionally before the episode/window starts, from prior session
+        content the policy never had to act to get. Different trigger by
+        design — this task picks up mid-conversation where prior context
+        plausibly already exists, unlike Harness-1's from-scratch search task.
         """
         for s_idx in range(min(seed_session_count, len(sessions))):
             self.fs.seed_from_session(sessions[s_idx], session_idx=s_idx)

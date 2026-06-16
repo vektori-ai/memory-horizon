@@ -155,12 +155,6 @@ class VirtualFilesystem:
             line for lines in self.files.values() for line in lines
         )
 
-    def to_text(self) -> str:
-        """Flat text of all content lines — used for QA greping."""
-        return "\n".join(
-            line for lines in self.files.values() for line in lines
-        )
-
 
 def parse_op(response_str: str) -> dict:
     """Extract the JSON op dict from a model response string.

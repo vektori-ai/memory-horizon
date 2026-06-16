@@ -2,6 +2,18 @@
 
 All training data, actions, and verifier results are expressed in terms of these types.
 Design principle: everything JSON-serializable so trajectory datasets can be stored as JSONL.
+
+LEGACY NOTE: MemoryOp's CREATE_EPISODE/INFER_IMPLICIT/DECAY/KEEP_BOTH members and
+the MemoryLayer enum (FACT/INSIGHT/RAW) are not used by the live training
+pipeline — memory_fs.py/harness_state.py/agent_loop.py implement a different,
+simpler 5-op model (STORE_FACT/UPDATE/SUPERSEDE/COMPRESS/ABSTAIN, plus the
+harness-facing RETRIEVE/RESOLVE) with importance tags (tentative/confirmed/
+superseded) instead of layers. These are from an earlier, broader design.
+Nothing outside this file currently imports them (only QAPair/Session/
+Trajectory/Turn are used elsewhere, by the data converters) — left in place
+rather than deleted since trimming enum *values* is a real backward-compat
+risk if any saved JSONL ever serialized one of these op strings, not just a
+cleanup call.
 """
 
 from __future__ import annotations
@@ -59,7 +71,13 @@ CONFLICT_OPS: frozenset[MemoryOp] = frozenset({
 
 
 class MemoryLayer(str, Enum):
-    """Three-layer SGMem-validated memory architecture."""
+    """Three-layer memory architecture (fact / insight / raw).
+
+    Inspired by SGMem (sentence-graph memory for long-term conversational
+    agents) but not a direct match to that paper's actual structure (a
+    sentence graph, not a 3-layer split) — "SGMem-validated" overclaimed the
+    connection. Unused by the live pipeline, see module-level LEGACY NOTE.
+    """
     FACT    = "fact"     # atomic, key-addressable facts
     INSIGHT = "insight"  # synthesized cross-fact insights
     RAW     = "raw"      # verbatim sentences from conversation
