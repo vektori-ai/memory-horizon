@@ -60,7 +60,7 @@ image = (
     .add_local_file(Path(__file__).parent / "agent_loop.py",        "/root/agent_loop.py",        copy=True)
     .add_local_file(Path(__file__).parent / "agent_loop_config.yaml", "/root/agent_loop_config.yaml", copy=True)
     .add_local_file(Path(__file__).parent / "context1_service.py",  "/root/context1_service.py",  copy=True)
-    .run_commands("python /root/patch_verl.py")
+    .run_commands("python /root/patch_verl.py && echo '[patch] done v4-capture-bs-1'")
     .env({
         "HF_HOME": "/hf-cache",
         "TOKENIZERS_PARALLELISM": "false",
@@ -359,16 +359,15 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS, base_mod
         f"data.val_files={DATA_PATH / 'val.parquet'}",
         "data.train_batch_size=4",       # prompts per step; total rollouts = 4 × N_ROLLOUTS (dense probe windows need fewer concurrent seqs)
         "data.max_prompt_length=2048",
-        "data.max_response_length=256",
+        "data.max_response_length=1024",
         "data.filter_overlong_prompts=True",
         "data.truncation=right",
-        # model + LoRA (cuts optimizer states from 32 GB → ~320 MB)
+        # model — no LoRA for now (LoRA PEFT keys break SGLang weight transfer;
+        # tracking in patch_verl.py as a follow-up). Full-model training with
+        # FSDP+CPU offload: 16GB weights + 32GB Adam on CPU, fits on A100-80GB:2.
         f"actor_rollout_ref.model.path={base_model_path}",
         "actor_rollout_ref.model.use_remove_padding=True",
         "actor_rollout_ref.model.enable_gradient_checkpointing=True",
-        "actor_rollout_ref.model.lora_rank=32",
-        "actor_rollout_ref.model.lora_alpha=32",
-        "actor_rollout_ref.model.target_modules=all-linear",
         # actor
         f"actor_rollout_ref.actor.optim.lr=1e-4",
         "actor_rollout_ref.actor.ppo_mini_batch_size=4",
@@ -380,19 +379,16 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS, base_mod
         "actor_rollout_ref.actor.fsdp_config.param_offload=True",
         "actor_rollout_ref.actor.fsdp_config.optimizer_offload=True",
         # rollout (SGLang — verl v0.5.0)
-        # TP=2 splits model across both GPUs; free_cache_engine offloads KV between phases;
-        # enforce_eager required with free_cache_engine; gpu_memory_utilization=0.2 leaves
-        # headroom for FSDP allgathers (model=8GB + KV=8GB per GPU at 0.2×80GB=16GB)
+        # TP=1: each GPU runs its own independent SGLang server (no TP collective
+        # ops during init). Full model per GPU (16GB) + KV (0.35×80=28GB) = 44GB,
+        # fits 80GB. TP=2 was crashing during NCCL init before any training step.
         "actor_rollout_ref.rollout.name=sglang",
-        "actor_rollout_ref.rollout.tensor_model_parallel_size=2",
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.30",  # 0.30×80=24GB KV; leaves ~50GB headroom so CUDA-graph capture + SGLang init don't race
+        "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.35",
         "actor_rollout_ref.rollout.free_cache_engine=True",
         "actor_rollout_ref.rollout.enforce_eager=True",
-        # enforce_eager only disables runtime compilation; disable_cuda_graph
-        # explicitly prevents the CUDA graph capture loop at init time.
-        # Both are needed: enforce_eager alone does NOT stop "Capture cuda graph bs".
         "++actor_rollout_ref.rollout.engine_kwargs.sglang.disable_cuda_graph=true",
-        "actor_rollout_ref.rollout.multi_stage_wake_up=True",    # resume weights→state_dict→resume KV; prevents state_dict OOM when KV+weights+alloc all compete
+        "actor_rollout_ref.rollout.multi_stage_wake_up=True",
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2",
         f"actor_rollout_ref.rollout.n={N_ROLLOUTS}",
         # multi-turn AgentLoop — mode=async is required: verl's AgentLoop registry/

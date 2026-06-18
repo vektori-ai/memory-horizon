@@ -143,76 +143,123 @@ def patch_grpo_stepwise() -> None:
 # ---------------------------------------------------------------------------
 
 def patch_disable_cuda_graphs() -> None:
-    # Exact target identified from image build diagnostics:
-    # sglang/srt/model_executor/cuda_graph_runner.py line ~231
-    #   rank0_log(f"Capture cuda graph bs {self.capture_bs}")
-    # The capture loop that follows this log runs the full model N times (once
-    # per batch size up to 160), racing with SGLang KV allocation → OOM.
-    # Fix: zero out self.capture_bs before the log so the for-loop runs 0 times.
+    """Two-file patch to disable CUDA graph capture in SGLang.
 
-    target = Path("/usr/local/lib/python3.10/dist-packages/sglang/srt/model_executor/cuda_graph_runner.py")
-    if not target.exists():
-        # Fallback: grep for it
+    1. cuda_graph_runner.py: zero self.capture_bs so the capture loop runs 0 times.
+    2. model_runner.py: guard max(self.capture_bs) — raises ValueError on empty list.
+
+    Both patches are applied independently so neither skips the other.
+    """
+    model_executor = Path(
+        "/usr/local/lib/python3.10/dist-packages/sglang/srt/model_executor"
+    )
+    if not model_executor.exists():
+        # Fallback: grep for cuda_graph_runner.py
         import subprocess as _sp
         site = Path("/usr/local/lib/python3.10/dist-packages")
-        for pkg in ["sglang", "vllm", ""]:
-            d = site / pkg if pkg else site
-            if not d.exists():
-                continue
-            r = _sp.run(f"grep -rl 'Capture cuda graph bs' {d} 2>/dev/null",
-                        shell=True, capture_output=True, text=True)
-            hits = [Path(p) for p in r.stdout.strip().splitlines() if p]
-            if hits:
-                target = hits[0]
-                break
+        r = _sp.run(
+            f"grep -rl 'Capture cuda graph bs' {site} 2>/dev/null",
+            shell=True, capture_output=True, text=True,
+        )
+        hits = [Path(p) for p in r.stdout.strip().splitlines() if p]
+        if hits:
+            model_executor = hits[0].parent
+        else:
+            print("[patch] cuda_graph: sglang model_executor dir not found — skipping")
+            return
 
+    _patch_cuda_graph_runner(model_executor / "cuda_graph_runner.py")
+    _patch_model_runner_max_bs(model_executor / "model_runner.py")
+
+
+def _patch_cuda_graph_runner(target: Path) -> None:
     if not target.exists():
-        print("[patch] cuda_graph: cuda_graph_runner.py not found — skipping")
+        print(f"[patch] cuda_graph_runner: {target} not found — skipping")
         return
 
     try:
         src = target.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
-        print(f"[patch] cuda_graph: could not read {target}: {e}", file=sys.stderr)
+        print(f"[patch] cuda_graph_runner: read error: {e}", file=sys.stderr)
         return
 
     if "# [patch] cuda graph disabled" in src:
-        print(f"[patch] cuda_graph: already patched in {target} — skipping")
+        print(f"[patch] cuda_graph_runner: already patched — skipping")
         return
 
-    # Find the exact indentation of the rank0_log line so we can insert above it
     needle = 'rank0_log(f"Capture cuda graph bs {self.capture_bs}")'
     if needle not in src:
-        # Try alternate quote styles
         needle = "rank0_log(f'Capture cuda graph bs {self.capture_bs}')"
     if needle not in src:
-        print(f"[patch] cuda_graph: needle not found in {target} — printing context for next run")
+        print(f"[patch] cuda_graph_runner: needle not found in {target}")
         for i, line in enumerate(src.splitlines(), 1):
             if "Capture cuda graph" in line:
                 print(f"  {i:4d}: {repr(line)}")
         return
 
-    # Find indentation of the needle line
     for line in src.splitlines():
         if needle in line:
-            indent = len(line) - len(line.lstrip())
+            ind = " " * (len(line) - len(line.lstrip()))
             break
-    ind = " " * indent
 
-    # Insert `self.capture_bs = []` on the line immediately before the log
-    old_line = f"{ind}{needle}"
+    old_line  = f"{ind}{needle}"
     new_lines = (
-        f"{ind}self.capture_bs = []  # [patch] cuda graph disabled — avoids OOM race\n"
+        # [1] instead of [] — avoids ValueError: max() arg is an empty sequence in
+        # model_runner.py when it reads capture_bs after CudaGraphRunner init.
+        # A single bs=1 graph is trivial (~100MB); skipping bs=[2,4,...,160] avoids
+        # the OOM race with SGLang KV allocation.
+        f"{ind}self.capture_bs = [1]  # [patch] minimal capture — skip bs=[2..160], avoid max([]) crash\n"
         f"{old_line}"
     )
     patched = src.replace(old_line, new_lines, 1)
-
     if patched == src:
-        print(f"[patch] cuda_graph: replacement failed (indent mismatch?) in {target}", file=sys.stderr)
+        print(f"[patch] cuda_graph_runner: replacement failed in {target}", file=sys.stderr)
         return
 
     target.write_text(patched, encoding="utf-8")
-    print(f"[patch] cuda_graph: self.capture_bs zeroed in {target} ✓")
+    print(f"[patch] cuda_graph_runner: capture_bs=[1] (minimal) ✓")
+
+
+def _patch_model_runner_max_bs(target: Path) -> None:
+    """Guard max(self.capture_bs) — raises ValueError on empty list after our patch."""
+    import re as _re
+
+    if not target.exists():
+        print(f"[patch] model_runner: {target} not found — skipping")
+        return
+
+    try:
+        src = target.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        print(f"[patch] model_runner: read error: {e}", file=sys.stderr)
+        return
+
+    if "# [patch] guard empty capture_bs" in src:
+        print(f"[patch] model_runner: max_bs guard already applied — skipping")
+        return
+
+    # Use regex to handle any whitespace variation in the assignment
+    pattern = r'(self\.max_bs\s*=\s*)max\(self\.capture_bs\)'
+    if not _re.search(pattern, src):
+        print(f"[patch] model_runner: self.max_bs pattern not found — scanning for clues:")
+        lines = src.splitlines()
+        for i, line in enumerate(lines, 1):
+            if any(kw in line for kw in ("max_bs", "capture_bs", "max(self", "init_cuda")):
+                print(f"  {i:4d}: {repr(line)}")
+        # Show lines 1145-1160 (around the crash location)
+        print("  [lines 1145-1160 of model_runner.py]:")
+        for i, line in enumerate(lines[1144:1160], 1145):
+            print(f"  {i:4d}: {repr(line)}")
+        return
+
+    patched = _re.sub(
+        pattern,
+        r'\1(max(self.capture_bs) if self.capture_bs else 1)  # [patch] guard empty capture_bs',
+        src,
+        count=1,
+    )
+    target.write_text(patched, encoding="utf-8")
+    print(f"[patch] model_runner: max_bs guard applied ✓")
 
 
 # ---------------------------------------------------------------------------

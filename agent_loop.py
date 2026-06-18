@@ -419,17 +419,22 @@ class MemoryAgentLoop(_MemoryAgentLoopBase):
         # text, never returned from run(). reward.py independently replays this same
         # transcript (replay_and_score) to recompute an equivalent score for the
         # actual training signal — this method's return value never reaches verl.
-        _log_episode_stats(all_responses, harness.summary())
+        summary = harness.summary()
+        _log_episode_stats(all_responses, summary)
 
         # num_turns mirrors what verl's shipped SingleTurnAgentLoop/ToolAgentLoop both
         # populate (informational/logging — write+retrieve steps plus probe steps).
         num_turns = (1 + len(rest_turns)) + len(qa_probes)
-
         return _AgentLoopOutput(
             prompt_ids    = all_prompt_ids,
             response_ids  = all_resp_ids,
             response_mask = all_resp_mask,
             num_turns     = num_turns,
+            metrics       = {
+                "mean_resolve":  summary["mean_resolve"],
+                "n_retrievals":  summary["n_retrievals"],
+                "op_counts":     str(summary["op_counts"]),
+            },
         )
 
 
