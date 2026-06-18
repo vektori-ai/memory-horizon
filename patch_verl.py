@@ -263,12 +263,81 @@ def _patch_model_runner_max_bs(target: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Patch 4 — fix extra_info handling in AgentLoopWorker.generate_sequences()
+# ---------------------------------------------------------------------------
+# verl's DataLoader stores extra_info as a Python dict (calls .get() on it).
+# verl's AgentLoopWorker.generate_sequences() then tries extra_info.strip()
+# before json.loads(), expecting a JSON string.
+# These are mutually exclusive: dict has no .strip(); string has no .get().
+#
+# Fix: in generate_sequences(), add a type guard before the .strip() call so
+# it handles both dict (from our data) and string (legacy path) correctly.
+# ---------------------------------------------------------------------------
+
+def patch_agent_loop_extra_info() -> None:
+    path = VERL_SITE / "experimental/agent_loop/agent_loop.py"
+    if not path.exists():
+        print(f"[patch] agent_loop extra_info: {path} not found — skipping")
+        return
+
+    src = path.read_text(encoding="utf-8", errors="replace")
+
+    if "# [patch] extra_info type guard" in src:
+        print("[patch] agent_loop extra_info: already patched — skipping")
+        return
+
+    # Find the pattern where verl calls .strip() on extra_info before json.loads()
+    # Typical pattern: json.loads(extra_info.strip()) or extra_info = extra_info.strip()
+    import re as _re
+
+    patterns = [
+        # json.loads(extra_info.strip())
+        (r'json\.loads\(extra_info\.strip\(\)\)',
+         'json.loads(extra_info.strip() if isinstance(extra_info, str) else json.dumps(extra_info))  # [patch] extra_info type guard'),
+        # extra_info = extra_info.strip()
+        (r'extra_info\s*=\s*extra_info\.strip\(\)',
+         'extra_info = extra_info.strip() if isinstance(extra_info, str) else extra_info  # [patch] extra_info type guard'),
+        # extra_info.strip() in other contexts
+        (r'extra_info\.strip\(\)',
+         '(extra_info.strip() if isinstance(extra_info, str) else json.dumps(extra_info))  # [patch] extra_info type guard'),
+    ]
+
+    patched = src
+    applied = False
+    for pattern, replacement in patterns:
+        new_src = _re.sub(pattern, replacement, patched, count=1)
+        if new_src != patched:
+            patched = new_src
+            applied = True
+            print(f"[patch] agent_loop extra_info: patched pattern '{pattern[:40]}...' ✓")
+            break
+
+    if not applied:
+        print(f"[patch] agent_loop extra_info: no .strip() pattern found — printing generate_sequences:")
+        in_fn = False
+        for i, line in enumerate(src.splitlines(), 1):
+            if "def generate_sequences" in line:
+                in_fn = True
+            if in_fn:
+                print(f"  {i:4d}: {repr(line)}")
+                if i > 0 and line.strip() == "" and in_fn:
+                    break  # stop at first blank line after function body
+                if i > 50:
+                    break
+        return
+
+    path.write_text(patched, encoding="utf-8")
+    print("[patch] agent_loop extra_info: extra_info type guard applied ✓")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     errors = []
-    for fn in (patch_dp_actor, patch_grpo_stepwise, patch_disable_cuda_graphs):
+    for fn in (patch_dp_actor, patch_grpo_stepwise, patch_disable_cuda_graphs,
+               patch_agent_loop_extra_info):
         try:
             fn()
         except Exception as exc:

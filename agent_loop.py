@@ -207,10 +207,7 @@ def build_verl_batch(
                 # MemoryAgentLoop instead of the default single_turn_agent loop.
                 "agent_name":   "memory_agent",
                 "reward_model": {"ground_truth": json.dumps(scoreable)},
-                # JSON-serialize extra_info: verl's AgentLoopWorker calls
-                # extra_info.strip() before json.loads() — it must be a string,
-                # not a Python dict (a dict has no .strip() method).
-                "extra_info": json.dumps({
+                "extra_info": {
                     "trajectory_id":      traj_id,
                     "window_start":       win_start,
                     "first_turn":         first_turn,
@@ -219,7 +216,7 @@ def build_verl_batch(
                     "window_session_ids": list(window_session_ids),
                     "sessions":           sessions,   # needed by derive_ledger
                     "context1_url":       "",  # filled in by train_modal.py at prep time
-                }),
+                },
             })
 
     kept = total_windows - skipped_windows
