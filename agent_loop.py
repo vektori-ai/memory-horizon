@@ -207,7 +207,10 @@ def build_verl_batch(
                 # MemoryAgentLoop instead of the default single_turn_agent loop.
                 "agent_name":   "memory_agent",
                 "reward_model": {"ground_truth": json.dumps(scoreable)},
-                "extra_info": {
+                # JSON-serialize extra_info: verl's AgentLoopWorker calls
+                # extra_info.strip() before json.loads() — it must be a string,
+                # not a Python dict (a dict has no .strip() method).
+                "extra_info": json.dumps({
                     "trajectory_id":      traj_id,
                     "window_start":       win_start,
                     "first_turn":         first_turn,
@@ -216,7 +219,7 @@ def build_verl_batch(
                     "window_session_ids": list(window_session_ids),
                     "sessions":           sessions,   # needed by derive_ledger
                     "context1_url":       "",  # filled in by train_modal.py at prep time
-                },
+                }),
             })
 
     kept = total_windows - skipped_windows
@@ -277,7 +280,19 @@ class MemoryAgentLoop(_MemoryAgentLoopBase):
         if _AgentLoopBase is None:
             raise ImportError("verl not installed — MemoryAgentLoop requires verl v0.5.0")
 
-        extra        = sampling_params.get("extra_info", {})
+        # verl calls extra_info.strip() before json.loads() — it expects a JSON string.
+        # Accept both str (verl already decoded it) and dict (passed directly).
+        raw_extra = sampling_params.get("extra_info", "{}")
+        if isinstance(raw_extra, str):
+            try:
+                extra = json.loads(raw_extra)
+            except (json.JSONDecodeError, TypeError):
+                extra = {}
+        elif isinstance(raw_extra, dict):
+            extra = raw_extra
+        else:
+            extra = {}
+
         rest_turns   = extra.get("rest_turns", [])
         qa_probes    = extra.get("qa_probes", [])
         window_sids  = set(extra.get("window_session_ids", []))

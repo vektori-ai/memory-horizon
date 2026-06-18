@@ -126,10 +126,15 @@ def prep(jsonl_data: str, test_jsonls: dict[str, str] | None = None) -> None:
     train_examples = build_verl_batch(train_trajs)
     val_examples   = build_verl_batch(val_trajs)
 
-    # Stamp Context-1 URL into every row so the agent loop can call it during rollouts
+    # Stamp Context-1 URL into every row so the agent loop can call it during rollouts.
+    # extra_info is a JSON string (verl requires .strip() + json.loads()) — patch it
+    # by round-tripping through JSON rather than mutating the dict directly.
     if CONTEXT1_SERVICE_URL:
+        import json as _json
         for row in train_examples + val_examples:
-            row["extra_info"]["context1_url"] = CONTEXT1_SERVICE_URL
+            ei = _json.loads(row["extra_info"])
+            ei["context1_url"] = CONTEXT1_SERVICE_URL
+            row["extra_info"] = _json.dumps(ei)
     print(f"Trajectories — train: {len(train_trajs)}, val: {len(val_trajs)}")
     print(f"Episode windows — train: {len(train_examples)}, val: {len(val_examples)}")
 
