@@ -71,18 +71,37 @@ def download_longmemeval() -> Path:
         return out
 
     print("[longmemeval] downloading xiaowu0162/longmemeval from HuggingFace ...")
+    import urllib.request
+
+    # Direct parquet download from the HF dataset repo (avoids trust_remote_code /
+    # loading-script issues with newer datasets versions).
+    url = "https://huggingface.co/datasets/xiaowu0162/longmemeval/resolve/main/longmemeval_s.json"
+    try:
+        print(f"  trying direct JSON download: {url}")
+        urllib.request.urlretrieve(url, out)
+        with open(out) as f:
+            rows = json.load(f)
+        print(f"[longmemeval] saved {len(rows)} instances → {out}")
+        return out
+    except Exception as e:
+        print(f"  direct download failed ({e}), trying HF datasets library ...")
+
     from datasets import load_dataset
 
-    # Try the -s (single-needle, 500 QA) split first; fall back to full dataset
-    try:
-        ds = load_dataset("xiaowu0162/longmemeval", "longmemeval_s", split="test", trust_remote_code=True)
-    except Exception:
-        ds = load_dataset("xiaowu0162/longmemeval", split="test", trust_remote_code=True)
+    for kwargs in [
+        {"path": "xiaowu0162/longmemeval", "name": "longmemeval_s", "split": "test"},
+        {"path": "xiaowu0162/longmemeval", "split": "test"},
+    ]:
+        try:
+            ds = load_dataset(**kwargs)
+            rows = [dict(row) for row in ds]
+            out.write_text(json.dumps(rows, ensure_ascii=False, indent=2))
+            print(f"[longmemeval] saved {len(rows)} instances → {out}")
+            return out
+        except Exception as exc:
+            print(f"  attempt failed: {exc}")
 
-    rows = [dict(row) for row in ds]
-    out.write_text(json.dumps(rows, ensure_ascii=False, indent=2))
-    print(f"[longmemeval] saved {len(rows)} instances → {out}")
-    return out
+    raise RuntimeError("Could not download LongMemEval — all methods failed")
 
 
 def convert_longmemeval(src: Path) -> None:

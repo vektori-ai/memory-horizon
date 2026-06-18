@@ -66,7 +66,26 @@ image = (
         "TOKENIZERS_PARALLELISM": "false",
         "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512,garbage_collection_threshold:0.8",
         "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "True",
+        # Disable Ray's OOM killer so workers emit real CUDA OOM errors instead
+        # of dying silently with SYSTEM_ERROR / connection code 2.
+        "RAY_memory_monitor_refresh_ms": "0",
+        "HYDRA_FULL_ERROR": "1",
     })
+)
+
+# Separate lightweight image for SFT — the verl base image has an apex build
+# that conflicts with HuggingFace Trainer (apex.amp not importable). SFT only
+# needs transformers + peft + torch; no verl/SGLang/apex required.
+sft_image = (
+    modal.Image.from_registry("pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime")
+    .run_commands(
+        "pip install transformers>=4.51.0 peft>=0.14.0 accelerate>=1.2.1 wandb datasets",
+    )
+    .add_local_file(Path(__file__).parent / "agent_loop.py",    "/root/agent_loop.py",    copy=True)
+    .add_local_file(Path(__file__).parent / "harness_state.py", "/root/harness_state.py", copy=True)
+    .add_local_file(Path(__file__).parent / "memory_fs.py",     "/root/memory_fs.py",     copy=True)
+    .add_local_file(Path(__file__).parent / "ledger.py",        "/root/ledger.py",        copy=True)
+    .env({"HF_HOME": "/hf-cache", "TOKENIZERS_PARALLELISM": "false"})
 )
 
 app = modal.App("memory-rlvr")
@@ -133,7 +152,7 @@ def prep(jsonl_data: str, test_jsonls: dict[str, str] | None = None) -> None:
 # ---------------------------------------------------------------------------
 
 @app.function(
-    image=image,
+    image=sft_image,
     gpu="A100-80GB:2",
     timeout=3 * 60 * MINUTES,
     volumes={
@@ -299,6 +318,37 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS, base_mod
     """
     data_volume.reload()
 
+    import json as _json
+
+    # Qwen3 tokenizer saved by transformers>=4.51 stores extra_special_tokens as a
+    # list []; the older transformers in the verl image expects a dict and calls
+    # .keys() on it, crashing Ray workers before training starts. Patch in-place.
+    _tok_cfg = Path(base_model_path) / "tokenizer_config.json"
+    if _tok_cfg.exists():
+        _cfg = _json.loads(_tok_cfg.read_text())
+        if isinstance(_cfg.get("extra_special_tokens"), list):
+            _cfg["extra_special_tokens"] = {}
+            _tok_cfg.write_text(_json.dumps(_cfg))
+            print("[patch] tokenizer_config.json: extra_special_tokens list→dict")
+
+    # transformers>=4.52 saves SFT checkpoints with use_cache=False and may write
+    # rope_theta=10000.0 (wrong default) instead of 1000000. Fix both so the verl
+    # image loads the checkpoint correctly.
+    _model_cfg = Path(base_model_path) / "config.json"
+    if _model_cfg.exists():
+        _cfg = _json.loads(_model_cfg.read_text())
+        changed = False
+        if not _cfg.get("use_cache", True):
+            _cfg["use_cache"] = True
+            changed = True
+        # Restore correct Qwen3-8B rope_theta if the checkpoint clobbered it
+        if _cfg.get("rope_theta") == 10000.0 and _cfg.get("model_type") == "qwen3":
+            _cfg["rope_theta"] = 1000000.0
+            changed = True
+        if changed:
+            _model_cfg.write_text(_json.dumps(_cfg))
+            print(f"[patch] config.json: use_cache={_cfg.get('use_cache')}, rope_theta={_cfg.get('rope_theta', 'N/A (uses rope_parameters)')}")
+
     cmd = [
         "python", "-m", "verl.trainer.main_ppo",
         # algorithm
@@ -335,9 +385,13 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS, base_mod
         # headroom for FSDP allgathers (model=8GB + KV=8GB per GPU at 0.2×80GB=16GB)
         "actor_rollout_ref.rollout.name=sglang",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=2",
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.48",  # 0.48×79.25-4.14=33.9GB KV; fits warmup(23.6GB) and leaves 2GB free after KV resume for generation
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.30",  # 0.30×80=24GB KV; leaves ~50GB headroom so CUDA-graph capture + SGLang init don't race
         "actor_rollout_ref.rollout.free_cache_engine=True",
         "actor_rollout_ref.rollout.enforce_eager=True",
+        # enforce_eager only disables runtime compilation; disable_cuda_graph
+        # explicitly prevents the CUDA graph capture loop at init time.
+        # Both are needed: enforce_eager alone does NOT stop "Capture cuda graph bs".
+        "++actor_rollout_ref.rollout.engine_kwargs.sglang.disable_cuda_graph=true",
         "actor_rollout_ref.rollout.multi_stage_wake_up=True",    # resume weights→state_dict→resume KV; prevents state_dict OOM when KV+weights+alloc all compete
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2",
         f"actor_rollout_ref.rollout.n={N_ROLLOUTS}",
@@ -357,6 +411,11 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS, base_mod
         "actor_rollout_ref.rollout.agent.agent_loop_config_path=/root/agent_loop_config.yaml",
         # raw chat format required for AgentLoop
         "data.return_raw_chat=True",
+        # torch.compile / CUDA graph capture is disabled: capturing graphs for
+        # batch_sizes=[1,2,4,...,160] creates huge GPU memory spikes that race
+        # with SGLang's initial KV allocation, causing OOM even on A100-80GB.
+        "actor_rollout_ref.actor.use_torch_compile=False",
+        "actor_rollout_ref.ref.use_torch_compile=False",
         # ref model
         "actor_rollout_ref.ref.fsdp_config.param_offload=True",
         "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2",
@@ -553,18 +612,17 @@ def sanity():
 
 
 @app.local_entrypoint()
-def train_only(base_model_path: str = ""):
+def train_only(base_model_path: str = MODEL_ID):
     """Train using existing parquet on the data volume (skips data prep).
 
-    Pass base_model_path=<sft()'s merged_checkpoint> (printed by run_sft below)
-    to actually warm-start from the SFT run instead of the raw base model:
-        modal run train_modal.py::train_only --base-model-path /models/sft_warmup_merged
+    Defaults to base Qwen3-8B (simplest path — use this to test whether the
+    OOM is from the SFT checkpoint config). Override with:
+        --base-model-path /models/sft_warmup_merged
+    to warm-start from the SFT checkpoint once the base run is confirmed working.
     """
     print("Starting GRPO training...")
-    kwargs = {"run_name": "locomo_lme_run_002"}
-    if base_model_path:
-        kwargs["base_model_path"] = base_model_path
-        print(f"Warm-starting from SFT checkpoint: {base_model_path}")
+    kwargs = {"run_name": "locomo_lme_run_004", "base_model_path": base_model_path}
+    print(f"Starting from: {base_model_path}")
     result = train.remote(**kwargs)
     print("Done:", result)
 

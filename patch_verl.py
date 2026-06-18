@@ -133,12 +133,95 @@ def patch_grpo_stepwise() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Patch 3 — disable CUDA graph capture in the hybrid actor
+# ---------------------------------------------------------------------------
+# verl's hybrid actor captures CUDA graphs for batch_sizes=[1,2,4,...,160]
+# at init time, while SGLang is simultaneously allocating its KV cache.
+# The combined peak OOMs on A100-80GB.  Since we run enforce_eager=True on
+# SGLang and LoRA on the FSDP actor, CUDA graphs provide no correctness
+# benefit and can be disabled by replacing the batch-size list with [].
+# ---------------------------------------------------------------------------
+
+def patch_disable_cuda_graphs() -> None:
+    # Exact target identified from image build diagnostics:
+    # sglang/srt/model_executor/cuda_graph_runner.py line ~231
+    #   rank0_log(f"Capture cuda graph bs {self.capture_bs}")
+    # The capture loop that follows this log runs the full model N times (once
+    # per batch size up to 160), racing with SGLang KV allocation → OOM.
+    # Fix: zero out self.capture_bs before the log so the for-loop runs 0 times.
+
+    target = Path("/usr/local/lib/python3.10/dist-packages/sglang/srt/model_executor/cuda_graph_runner.py")
+    if not target.exists():
+        # Fallback: grep for it
+        import subprocess as _sp
+        site = Path("/usr/local/lib/python3.10/dist-packages")
+        for pkg in ["sglang", "vllm", ""]:
+            d = site / pkg if pkg else site
+            if not d.exists():
+                continue
+            r = _sp.run(f"grep -rl 'Capture cuda graph bs' {d} 2>/dev/null",
+                        shell=True, capture_output=True, text=True)
+            hits = [Path(p) for p in r.stdout.strip().splitlines() if p]
+            if hits:
+                target = hits[0]
+                break
+
+    if not target.exists():
+        print("[patch] cuda_graph: cuda_graph_runner.py not found — skipping")
+        return
+
+    try:
+        src = target.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        print(f"[patch] cuda_graph: could not read {target}: {e}", file=sys.stderr)
+        return
+
+    if "# [patch] cuda graph disabled" in src:
+        print(f"[patch] cuda_graph: already patched in {target} — skipping")
+        return
+
+    # Find the exact indentation of the rank0_log line so we can insert above it
+    needle = 'rank0_log(f"Capture cuda graph bs {self.capture_bs}")'
+    if needle not in src:
+        # Try alternate quote styles
+        needle = "rank0_log(f'Capture cuda graph bs {self.capture_bs}')"
+    if needle not in src:
+        print(f"[patch] cuda_graph: needle not found in {target} — printing context for next run")
+        for i, line in enumerate(src.splitlines(), 1):
+            if "Capture cuda graph" in line:
+                print(f"  {i:4d}: {repr(line)}")
+        return
+
+    # Find indentation of the needle line
+    for line in src.splitlines():
+        if needle in line:
+            indent = len(line) - len(line.lstrip())
+            break
+    ind = " " * indent
+
+    # Insert `self.capture_bs = []` on the line immediately before the log
+    old_line = f"{ind}{needle}"
+    new_lines = (
+        f"{ind}self.capture_bs = []  # [patch] cuda graph disabled — avoids OOM race\n"
+        f"{old_line}"
+    )
+    patched = src.replace(old_line, new_lines, 1)
+
+    if patched == src:
+        print(f"[patch] cuda_graph: replacement failed (indent mismatch?) in {target}", file=sys.stderr)
+        return
+
+    target.write_text(patched, encoding="utf-8")
+    print(f"[patch] cuda_graph: self.capture_bs zeroed in {target} ✓")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     errors = []
-    for fn in (patch_dp_actor, patch_grpo_stepwise):
+    for fn in (patch_dp_actor, patch_grpo_stepwise, patch_disable_cuda_graphs):
         try:
             fn()
         except Exception as exc:

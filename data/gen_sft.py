@@ -31,7 +31,7 @@ from agent_loop import _SYSTEM_PROMPT  # noqa: E402 (import after sys.path tweak
 DATA = ROOT / "data"
 DEFAULT_OUT = DATA / "sft_traces.jsonl"
 
-MODEL = "gpt-oss-120b"   # OpenAI GPT-OSS 120B
+MODEL = "gpt-4o-mini"    # fast + cheap for SFT trace generation
 
 # Teacher uses the EXACT same system prompt as the RL policy (agent_loop.py).
 # Used to keep a hand-duplicated copy here that had drifted from the real one —
