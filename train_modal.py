@@ -734,11 +734,6 @@ def run_sft():
     """
     import subprocess, os, sys
 
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        print("Error: OPENAI_API_KEY not set")
-        sys.exit(1)
-
     locomo_src = REPO_ROOT / "data" / "locomo10.json"
     sft_out    = REPO_ROOT / "data" / "sft_traces.jsonl"
 
@@ -746,9 +741,12 @@ def run_sft():
         print(f"Error: {locomo_src} not found — run python data/download_data.py first")
         sys.exit(1)
 
-    # Generate traces locally (cheap API calls, no GPU needed)
     if not sft_out.exists():
-        print("Generating SFT traces with GPT-OSS 120B ...")
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            print("Error: OPENAI_API_KEY not set (needed to generate traces; set it or run gen_sft.py manually first)")
+            sys.exit(1)
+        print("Generating SFT traces with GPT-4o-mini ...")
         result = subprocess.run(
             [sys.executable, str(REPO_ROOT / "data" / "gen_sft.py"),
              "--src", str(locomo_src), "--out", str(sft_out), "--n", "200"],

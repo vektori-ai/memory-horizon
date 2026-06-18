@@ -241,21 +241,122 @@ def generate(
     return traces_written
 
 
+def generate_resolve_traces(
+    locomo_path: Path,
+    out_path: Path,
+    n_target: int = 80,
+) -> int:
+    """Generate RESOLVE SFT examples from LoCoMo QA pairs (no API calls).
+
+    Builds a synthetic FS state per QA item (evidence turns + answer stored at a
+    plausible path), then teaches the model:
+        [Memory state]\\n{state}\\n\\n[Question]\\n{question} → RESOLVE with answer
+
+    Without these examples the SFT model has no RESOLVE training signal —
+    it never sees the [Question] prompt format and can't produce non-zero rewards.
+    """
+    with open(locomo_path) as f:
+        raw = json.load(f)
+
+    traces_written = 0
+
+    with open(out_path, "a") as out_f:
+        for conv in raw:
+            if traces_written >= n_target:
+                break
+
+            qa_pairs = conv.get("qa", [])
+            cdata    = conv.get("conversation", {})
+            spk_a    = cdata.get("speaker_a", "PersonA")
+
+            for qa_item in qa_pairs:
+                if traces_written >= n_target:
+                    break
+
+                question = qa_item.get("question", "").strip()
+                answer   = qa_item.get("answer", "")
+                if not isinstance(answer, str):
+                    continue
+                answer = answer.strip()
+                if not answer or answer.lower() in ("yes", "no", "n/a", "abstain", ""):
+                    continue
+                if not question:
+                    continue
+
+                # Build a synthetic FS that contains the evidence turns + answer.
+                # Artificial, but correct teaching signal: "answer is in memory → RESOLVE."
+                fs = _FS()
+                person_slug = spk_a.lower().replace(" ", "_")
+
+                for ev in qa_item.get("evidence", [])[:2]:
+                    if ":" not in str(ev):
+                        continue
+                    parts = str(ev).split(":")
+                    try:
+                        snum = int(parts[0][1:])
+                        tnum = int(parts[1]) - 1
+                        turns = cdata.get(f"session_{snum}", [])
+                        if 0 <= tnum < len(turns):
+                            t = turns[tnum]
+                            text = t.get("text", "").strip()
+                            if text:
+                                fs.apply({
+                                    "op":      "STORE_FACT",
+                                    "path":    f"{person_slug}/events",
+                                    "content": f"{t.get('speaker', '')}: {text}",
+                                })
+                    except (ValueError, IndexError):
+                        continue
+
+                # Always store the answer explicitly — model learns to find and echo it.
+                fs.apply({
+                    "op":      "UPDATE",
+                    "path":    f"{person_slug}/facts",
+                    "content": answer,
+                })
+
+                user_msg = (
+                    f"[Memory state]\n{fs.render()}\n\n"
+                    f"[Question]\n{question}"
+                )
+                trace = {
+                    "messages": [
+                        {"role": "system",    "content": _SFT_SYSTEM},
+                        {"role": "user",      "content": user_msg},
+                        {"role": "assistant", "content": json.dumps({"op": "RESOLVE", "content": answer})},
+                    ],
+                    "op":     "RESOLVE",
+                    "source": f"locomo_{conv.get('sample_id')}_resolve",
+                }
+                out_f.write(json.dumps(trace) + "\n")
+                out_f.flush()
+                traces_written += 1
+
+    print(f"Generated {traces_written} RESOLVE traces → {out_path}")
+    return traces_written
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--src", default="data/locomo10.json",  help="raw LoCoMo JSON")
-    parser.add_argument("--out", default=str(DEFAULT_OUT),      help="output JSONL")
-    parser.add_argument("--n",   type=int, default=200,         help="target trace count")
+    parser.add_argument("--src",     default="data/locomo10.json", help="raw LoCoMo JSON")
+    parser.add_argument("--out",     default=str(DEFAULT_OUT),     help="output JSONL")
+    parser.add_argument("--n",       type=int, default=200,        help="target store/update trace count")
+    parser.add_argument("--resolve", type=int, default=80,         help="target RESOLVE trace count (no API needed)")
+    parser.add_argument("--resolve-only", action="store_true",     help="skip API calls, only generate RESOLVE traces")
     args = parser.parse_args()
-
-    if not os.environ.get("OPENAI_API_KEY"):
-        print("Error: set OPENAI_API_KEY first")
-        sys.exit(1)
 
     src = ROOT / args.src
     if not src.exists():
         print(f"Error: {src} not found — run python data/download_data.py first")
         sys.exit(1)
 
-    count = generate(src, Path(args.out), n_target=args.n)
-    print(f"SFT traces: {count}. Next: modal run train_modal.py::sft")
+    if not args.resolve_only:
+        if not os.environ.get("OPENAI_API_KEY"):
+            print("Error: set OPENAI_API_KEY first (or use --resolve-only for RESOLVE traces only)")
+            sys.exit(1)
+        count = generate(src, Path(args.out), n_target=args.n)
+        print(f"Store/update traces: {count}")
+
+    if args.resolve > 0:
+        r_count = generate_resolve_traces(src, Path(args.out), n_target=args.resolve)
+        print(f"RESOLVE traces: {r_count}. Next: modal run train_modal.py::sft")
