@@ -275,29 +275,62 @@ def _patch_model_runner_max_bs(target: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def patch_agent_loop_extra_info() -> None:
-    path = VERL_SITE / "experimental/agent_loop/agent_loop.py"
-    if not path.exists():
-        print(f"[patch] agent_loop extra_info: {path} not found — skipping")
+    """Find the AgentLoopWorker file and patch extra_info.strip() to handle dicts.
+
+    verl's DataLoader stores extra_info as a Python dict (calls .get() on it).
+    verl's AgentLoopWorker then calls extra_info.strip() before json.loads(),
+    expecting a JSON string. Guard the .strip() call to handle both types.
+    """
+    import re as _re
+    import subprocess as _sp
+
+    # AgentLoopWorker may be in agent_loop.py OR in a separate worker file —
+    # grep for the actual .strip() call pattern to find the right file.
+    candidates = [
+        VERL_SITE / "experimental/agent_loop/agent_loop.py",
+        VERL_SITE / "experimental/agent_loop/worker.py",
+        VERL_SITE / "workers/rollout/sglang_rollout/agent_loop_worker.py",
+        VERL_SITE / "workers/rollout/vllm_rollout/agent_loop_worker.py",
+    ]
+    # Also search by grep
+    r = _sp.run(
+        f"grep -rl 'extra_info.*strip\\|strip.*extra_info' {VERL_SITE} 2>/dev/null",
+        shell=True, capture_output=True, text=True,
+    )
+    for hit in r.stdout.strip().splitlines():
+        p = Path(hit)
+        if p not in candidates:
+            candidates.append(p)
+
+    target = None
+    for c in candidates:
+        if c.exists():
+            src = c.read_text(encoding="utf-8", errors="replace")
+            if "extra_info" in src and "strip" in src:
+                target = c
+                break
+
+    if target is None:
+        print("[patch] agent_loop extra_info: no candidate file contains extra_info+strip — skipping")
+        print("[patch]   searched:", [str(c) for c in candidates[:6]])
+        # Diagnostic: print all files in experimental/agent_loop/
+        exp_dir = VERL_SITE / "experimental/agent_loop"
+        if exp_dir.exists():
+            for f in sorted(exp_dir.iterdir()):
+                print(f"  {f}")
         return
 
-    src = path.read_text(encoding="utf-8", errors="replace")
+    src = target.read_text(encoding="utf-8", errors="replace")
 
     if "# [patch] extra_info type guard" in src:
-        print("[patch] agent_loop extra_info: already patched — skipping")
+        print(f"[patch] agent_loop extra_info: already patched in {target} — skipping")
         return
 
-    # Find the pattern where verl calls .strip() on extra_info before json.loads()
-    # Typical pattern: json.loads(extra_info.strip()) or extra_info = extra_info.strip()
-    import re as _re
-
     patterns = [
-        # json.loads(extra_info.strip())
         (r'json\.loads\(extra_info\.strip\(\)\)',
          'json.loads(extra_info.strip() if isinstance(extra_info, str) else json.dumps(extra_info))  # [patch] extra_info type guard'),
-        # extra_info = extra_info.strip()
         (r'extra_info\s*=\s*extra_info\.strip\(\)',
          'extra_info = extra_info.strip() if isinstance(extra_info, str) else extra_info  # [patch] extra_info type guard'),
-        # extra_info.strip() in other contexts
         (r'extra_info\.strip\(\)',
          '(extra_info.strip() if isinstance(extra_info, str) else json.dumps(extra_info))  # [patch] extra_info type guard'),
     ]
@@ -309,25 +342,18 @@ def patch_agent_loop_extra_info() -> None:
         if new_src != patched:
             patched = new_src
             applied = True
-            print(f"[patch] agent_loop extra_info: patched pattern '{pattern[:40]}...' ✓")
+            print(f"[patch] agent_loop extra_info: patched '{pattern[:50]}' in {target.name} ✓")
             break
 
     if not applied:
-        print(f"[patch] agent_loop extra_info: no .strip() pattern found — printing generate_sequences:")
-        in_fn = False
+        print(f"[patch] agent_loop extra_info: no .strip() pattern matched in {target}")
         for i, line in enumerate(src.splitlines(), 1):
-            if "def generate_sequences" in line:
-                in_fn = True
-            if in_fn:
+            if "strip" in line and "extra_info" in line:
                 print(f"  {i:4d}: {repr(line)}")
-                if i > 0 and line.strip() == "" and in_fn:
-                    break  # stop at first blank line after function body
-                if i > 50:
-                    break
         return
 
-    path.write_text(patched, encoding="utf-8")
-    print("[patch] agent_loop extra_info: extra_info type guard applied ✓")
+    target.write_text(patched, encoding="utf-8")
+    print(f"[patch] agent_loop extra_info: extra_info type guard applied to {target.name} ✓")
 
 
 # ---------------------------------------------------------------------------

@@ -60,7 +60,7 @@ image = (
     .add_local_file(Path(__file__).parent / "agent_loop.py",        "/root/agent_loop.py",        copy=True)
     .add_local_file(Path(__file__).parent / "agent_loop_config.yaml", "/root/agent_loop_config.yaml", copy=True)
     .add_local_file(Path(__file__).parent / "context1_service.py",  "/root/context1_service.py",  copy=True)
-    .run_commands("python /root/patch_verl.py && echo '[patch] done v5-extra-info-guard'")
+    .run_commands("python /root/patch_verl.py && echo '[patch] done v6-extra-info-grep'")
     .env({
         "HF_HOME": "/hf-cache",
         "TOKENIZERS_PARALLELISM": "false",
