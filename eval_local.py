@@ -144,12 +144,12 @@ def run_episode(row: dict, policy_fn, resolve_fn=None) -> dict:
 
     reward  = harness.compute_reward()
     summary = harness.summary()
+    # mean_step/distinct_ops/diversity_bonus were dropped from compute_reward()
+    # (harness_state.py: constant-per-group terms, zero GRPO gradient, just
+    # noise) — current reward is mean(probe_scores) + format_penalty only.
     return {
         "reward":        reward,
         "mean_resolve":  summary["mean_resolve"],
-        "mean_step":     summary["mean_step"],
-        "distinct_ops":  summary["distinct_ops"],
-        "diversity_bonus": summary["diversity_bonus"],
         "n_confirmed":   summary["n_confirmed"],
         "n_tentative":   summary["n_tentative"],
         "op_counts":     summary["op_counts"],
@@ -171,8 +171,6 @@ def _fmt(vals: list[float]) -> str:
 def _report(label: str, results: list[dict]) -> None:
     rewards  = [r["reward"] for r in results]
     resolves = [r["mean_resolve"] for r in results]
-    steps    = [r["mean_step"] for r in results]
-    div_rate = sum(1 for r in results if r["diversity_bonus"] > 0) / max(len(results), 1)
     n_probes = mean(r["n_probes"] for r in results) if results else 0
 
     print(f"\n{'─'*55}")
@@ -180,8 +178,6 @@ def _report(label: str, results: list[dict]) -> None:
     print(f"{'─'*55}")
     print(f"  reward:        {_fmt(rewards)}")
     print(f"  resolve F1:    {_fmt(resolves)}")
-    print(f"  step reward:   {_fmt(steps)}")
-    print(f"  diversity bonus fires: {div_rate*100:.0f}% of episodes")
     print(f"  mean probes/ep: {n_probes:.1f}")
 
     # Op type breakdown
@@ -201,23 +197,20 @@ def _report(label: str, results: list[dict]) -> None:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--src",   default="data/locomo10.json")
+    parser.add_argument("--src",   default="data/locomo_train.jsonl")
     parser.add_argument("--n",     type=int, default=8,  help="trajectories to eval")
     parser.add_argument("--turns", type=int, default=5,  help="episode window size")
     args = parser.parse_args()
 
-    # Accept either raw locomo10.json or pre-converted locomo_trajs.json
+    # --src must be a converted Trajectory JSONL (sessions/qa_probes schema) —
+    # raw locomo10.json (conversation/qa schema) is NOT what build_verl_batch
+    # expects; run data/download_data.py first to produce the converted file.
     src = ROOT / args.src
-    trajs_src = ROOT / "data/locomo_trajs.json"
-    if trajs_src.exists():
-        with open(trajs_src) as f:
-            trajs = json.load(f)
-    elif src.exists():
+    if src.exists():
         with open(src) as f:
-            raw = json.load(f)
-        trajs = raw if isinstance(raw, list) else raw.get("train", raw.get("data", []))
+            trajs = [json.loads(line) for line in f if line.strip()]
     else:
-        print(f"[error] No data found — run: python3 eval_local.py after downloading data")
+        print(f"[error] No data found at {src} — run: python3 data/download_data.py first")
         sys.exit(1)
     rows  = build_verl_batch(trajs, window_size=args.turns, stride=3)
     if not rows:

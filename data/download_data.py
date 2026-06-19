@@ -36,19 +36,14 @@ def download_locomo() -> Path:
         print(f"[locomo] already at {out}, skipping download")
         return out
 
-    print("[locomo] downloading snap-research/locomo from HuggingFace ...")
-    from datasets import load_dataset
-    ds = load_dataset("snap-research/locomo", split="test", trust_remote_code=True)
-
-    conversations = []
-    for row in ds:
-        conversations.append({
-            "sample_id": row["sample_id"],
-            "conversation": row["conversation"],
-            "qa": row.get("qa", []),
-        })
-
-    out.write_text(json.dumps(conversations, ensure_ascii=False, indent=2))
+    # snap-research/locomo is a GitHub repo, not an HF Hub dataset — the
+    # load_dataset("snap-research/locomo", ...) call here never resolved to
+    # anything real. Raw data lives at data/locomo10.json in that repo.
+    print("[locomo] downloading raw locomo10.json from snap-research/locomo (GitHub) ...")
+    import urllib.request
+    url = "https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json"
+    urllib.request.urlretrieve(url, out)
+    conversations = json.loads(out.read_text())
     print(f"[locomo] saved {len(conversations)} conversations → {out}")
     return out
 
@@ -75,7 +70,7 @@ def download_longmemeval() -> Path:
 
     # Direct parquet download from the HF dataset repo (avoids trust_remote_code /
     # loading-script issues with newer datasets versions).
-    url = "https://huggingface.co/datasets/xiaowu0162/longmemeval/resolve/main/longmemeval_s.json"
+    url = "https://huggingface.co/datasets/xiaowu0162/longmemeval/resolve/main/longmemeval_s"
     try:
         print(f"  trying direct JSON download: {url}")
         urllib.request.urlretrieve(url, out)
