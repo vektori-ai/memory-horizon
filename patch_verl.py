@@ -140,6 +140,14 @@ def patch_grpo_stepwise() -> None:
 # The combined peak OOMs on A100-80GB.  Since we run enforce_eager=True on
 # SGLang and LoRA on the FSDP actor, CUDA graphs provide no correctness
 # benefit and can be disabled by replacing the batch-size list with [].
+#
+# On SGLang>=0.5.1.post3 this patch is expected to soft-fail (needle not
+# found — rank0_log was renamed log_info_on_rank0, and the max_bs line moved
+# from model_runner.py to cuda_graph_runner.py). That's fine: this SGLang
+# range ships a proper disable_cuda_graph server arg, set via
+# engine_kwargs.sglang.disable_cuda_graph=true in the verl launch command —
+# this source patch was a workaround for that toggle not fully working on
+# SGLang 0.4.8, not needed once the native arg works.
 # ---------------------------------------------------------------------------
 
 def patch_disable_cuda_graphs() -> None:
