@@ -16,6 +16,13 @@ training = [
     "accelerate>=0.34.0",
     "datasets>=2.20.0",
 ]
+# Pinned exactly to 0.12.2 -- 0.12.3.post1 has a CLI regression where every
+# `sky launch` without the deprecated --docker flag fails with
+# "False backend is not supported." (backend_name defaults to False, not
+# None). See sky/setup_common.sh and the AWS migration plan for context.
+aws = [
+    "skypilot[aws]==0.12.2",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
