@@ -1,0 +1,71 @@
+# SkyPilot task: GPT-OSS-20B GRPO, 8x H100-80GB (p5.48xlarge-equivalent).
+# Run ONLY after sky/gpt_oss_sanity.yaml has passed.
+#
+# Doubles as the utilization probe from the plan's "Maximizing GPU
+# utilization" section -- default N_STEPS=20 here IS that probe. Check
+# /mnt/mh-models/gpu_util.log (nvidia-smi dmon) or the wandb GPU-util panel
+# before committing to a long run: override N_STEPS for the real run via
+#   sky launch -c mh-train sky/gpt_oss_train.yaml --env N_STEPS=500 ...
+#
+# Usage (utilization probe, ~10-20 steps, ~$10-18):
+#   sky launch -c mh-train sky/gpt_oss_train.yaml --secret HF_TOKEN --secret WANDB_API_KEY
+# Usage (real run, after the probe confirms >85-90% utilization):
+#   sky launch -c mh-train sky/gpt_oss_train.yaml --env N_STEPS=500 --secret HF_TOKEN --secret WANDB_API_KEY
+
+resources:
+  cloud: aws
+  accelerators: H100:8
+  use_spot: false
+  image_id: docker:verlai/verl:app-verl0.5-sglang0.4.8-mcore0.12.2-te2.2
+
+secrets:
+  HF_TOKEN: null
+  WANDB_API_KEY: null
+
+envs:
+  N_GPUS: "8"
+  TRAIN_BATCH_SIZE: "16"   # 16 x N_ROLLOUTS=4 = 64 concurrent seqs / 8 GPUs = 8/GPU
+  N_ROLLOUTS: "4"
+  N_STEPS: "20"            # utilization-probe default -- raise to 500 for the real run
+  GPU_MEM_UTIL: "0.25"
+  RUN_NAME: "gpt_oss_20b_aws_train"
+  BASE_MODEL_PATH: "openai/gpt-oss-20b"
+  DATA_DIR: "/mnt/mh-data"
+  MODELS_DIR: "/mnt/mh-models"
+
+file_mounts:
+  /mnt/mh-data:
+    name: mh-data-478499050241
+    store: s3
+    mode: MOUNT
+  /mnt/mh-models:
+    name: mh-models-478499050241
+    store: s3
+    mode: MOUNT
+
+  /root/repo/agent_loop.py: ./agent_loop.py
+  /root/repo/agent_loop_config.yaml: ./agent_loop_config.yaml
+  /root/repo/reward.py: ./reward.py
+  /root/repo/memory_fs.py: ./memory_fs.py
+  /root/repo/ledger.py: ./ledger.py
+  /root/repo/harness_state.py: ./harness_state.py
+  /root/repo/patch_verl.py: ./patch_verl.py
+  /root/repo/mh_types.py: ./mh_types.py
+  /root/repo/sky/setup_common.sh: ./sky/setup_common.sh
+  /root/repo/sky/run_train.sh: ./sky/run_train.sh
+
+setup: |
+  bash /root/repo/sky/setup_common.sh
+
+run: |
+  mkdir -p "${MODELS_DIR}/${RUN_NAME}_logs"
+  nvidia-smi dmon -s u -d 5 > "${MODELS_DIR}/${RUN_NAME}_logs/gpu_util.log" 2>&1 &
+  DMON_PID=$!
+
+  bash /root/repo/sky/run_train.sh
+  TRAIN_EXIT=$?
+
+  kill "${DMON_PID}" 2>/dev/null || true
+  echo "[train] GPU utilization log: ${MODELS_DIR}/${RUN_NAME}_logs/gpu_util.log"
+  echo "[train] Check this (or the wandb GPU-util panel) before raising N_STEPS for the real run."
+  exit "${TRAIN_EXIT}"

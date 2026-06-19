@@ -1,0 +1,89 @@
+# SkyPilot task: GPT-OSS-20B compat gate. Run this BEFORE any sanity/train
+# task -- gates everything per the plan's "Software compatibility" section.
+# Checks, in order:
+#   1. patch_verl.py applies cleanly against verl==0.5.0 + SGLang>=0.5.1.post3
+#   2. openai/gpt-oss-20b loads under SGLang and produces a trivial completion
+#   3. zero-shot op-validity rate against the existing system prompt
+#      (decides whether the SFT sub-pipeline is needed at all)
+# Single GPU (p5.4xlarge) -- this is a load/smoke check, not training.
+#
+# Usage:
+#   sky launch -c mh-compat-gate sky/compat_gate.yaml --secret HF_TOKEN
+
+resources:
+  cloud: aws
+  accelerators: H100:1
+  use_spot: false
+  image_id: docker:verlai/verl:app-verl0.5-sglang0.4.8-mcore0.12.2-te2.2
+
+secrets:
+  HF_TOKEN: null
+
+file_mounts:
+  /root/repo/agent_loop.py: ./agent_loop.py
+  /root/repo/agent_loop_config.yaml: ./agent_loop_config.yaml
+  /root/repo/reward.py: ./reward.py
+  /root/repo/memory_fs.py: ./memory_fs.py
+  /root/repo/ledger.py: ./ledger.py
+  /root/repo/harness_state.py: ./harness_state.py
+  /root/repo/patch_verl.py: ./patch_verl.py
+  /root/repo/mh_types.py: ./mh_types.py
+  /root/repo/sky/setup_common.sh: ./sky/setup_common.sh
+  /root/repo/data/train.jsonl: ./data/train.jsonl
+
+setup: |
+  bash /root/repo/sky/setup_common.sh
+
+run: |
+  cd /root/repo
+  python3 - <<'PYEOF'
+  import json, sys
+  sys.path.insert(0, "/root/repo")
+
+  # --- Step 1: confirm gpt-oss-20b loads under SGLang and completes a trivial prompt ---
+  import sglang as sgl
+  print("[compat-gate] loading openai/gpt-oss-20b under SGLang ...")
+  engine = sgl.Engine(model_path="openai/gpt-oss-20b", tp_size=1)
+  out = engine.generate(["The capital of France is"], sampling_params={"max_new_tokens": 8})
+  print(f"[compat-gate] SGLang load + generate OK: {out}")
+
+  # --- Step 2: zero-shot op-validity rate against the real system prompt ---
+  from agent_loop import _SYSTEM_PROMPT, _format_turn
+  from memory_fs import parse_op, VirtualFilesystem
+
+  trajs = [json.loads(l) for l in open("data/train.jsonl") if l.strip()][:20]
+  prompts, turns_meta = [], []
+  for traj in trajs:
+      fs = VirtualFilesystem()
+      for session in traj.get("sessions", [])[:1]:
+          for turn in session.get("turns", [])[:5]:
+              content = turn.get("content", "").strip()
+              if not content:
+                  continue
+              prompt = (
+                  f"{_SYSTEM_PROMPT}\n\n"
+                  f"[Memory state]\n{fs.render_for_prompt()}\n\n"
+                  f"[Current turn]\n{_format_turn(turn)}"
+              )
+              prompts.append(prompt)
+
+  if prompts:
+      results = engine.generate(prompts, sampling_params={"max_new_tokens": 128})
+      texts = [r["text"] if isinstance(r, dict) else r for r in results]
+      valid = sum(1 for t in texts if parse_op(t) and parse_op(t).get("op") != "INVALID")
+      rate = valid / len(texts)
+      print(f"[compat-gate] zero-shot op-validity rate: {rate:.1%} ({valid}/{len(texts)})")
+      print("[compat-gate] >30-50% -> skip SFT sub-pipeline; near-zero -> build SFT for gpt-oss-20b")
+  else:
+      print("[compat-gate] no turns extracted from data/train.jsonl — check data format")
+  PYEOF
+
+  echo "[compat-gate] patch_verl.py check:"
+  python3 patch_verl.py
+  echo "[compat-gate] patch_verl.py exit code: $?"
+
+  echo "[compat-gate] DONE — review output above against the plan's pass/fail criteria before launching sky/gpt_oss_sanity.yaml"
+  echo "[compat-gate] NOT run here (separate, heavier check): GSM8K-style GRPO"
+  echo "  smoke test for the rollout_actor_probs_pearson_corr anomaly (verl #3894)."
+  echo "  Use verl's own GSM8K GRPO example/recipe on this same image+model before"
+  echo "  trusting reward numbers from sky/gpt_oss_sanity.yaml on the memory task."

@@ -1,0 +1,53 @@
+# SkyPilot task: GPT-OSS-20B GRPO sanity run, 20 steps, 1x H100-80GB.
+# Run ONLY after sky/compat_gate.yaml has passed.
+#
+# Usage:
+#   sky launch -c mh-sanity sky/gpt_oss_sanity.yaml --secret HF_TOKEN --secret WANDB_API_KEY
+
+resources:
+  cloud: aws
+  accelerators: H100:1
+  use_spot: false
+  image_id: docker:verlai/verl:app-verl0.5-sglang0.4.8-mcore0.12.2-te2.2
+
+secrets:
+  HF_TOKEN: null
+  WANDB_API_KEY: null
+
+envs:
+  N_GPUS: "1"
+  TRAIN_BATCH_SIZE: "4"
+  N_ROLLOUTS: "2"
+  N_STEPS: "20"
+  GPU_MEM_UTIL: "0.25"
+  RUN_NAME: "gpt_oss_20b_aws_sanity"
+  BASE_MODEL_PATH: "openai/gpt-oss-20b"
+  DATA_DIR: "/mnt/mh-data"
+  MODELS_DIR: "/mnt/mh-models"
+
+file_mounts:
+  /mnt/mh-data:
+    name: mh-data-478499050241
+    store: s3
+    mode: MOUNT
+  /mnt/mh-models:
+    name: mh-models-478499050241
+    store: s3
+    mode: MOUNT
+
+  /root/repo/agent_loop.py: ./agent_loop.py
+  /root/repo/agent_loop_config.yaml: ./agent_loop_config.yaml
+  /root/repo/reward.py: ./reward.py
+  /root/repo/memory_fs.py: ./memory_fs.py
+  /root/repo/ledger.py: ./ledger.py
+  /root/repo/harness_state.py: ./harness_state.py
+  /root/repo/patch_verl.py: ./patch_verl.py
+  /root/repo/mh_types.py: ./mh_types.py
+  /root/repo/sky/setup_common.sh: ./sky/setup_common.sh
+  /root/repo/sky/run_train.sh: ./sky/run_train.sh
+
+setup: |
+  bash /root/repo/sky/setup_common.sh
+
+run: |
+  bash /root/repo/sky/run_train.sh

@@ -1,0 +1,76 @@
+# SkyPilot task: data prep (JSONL -> parquet), CPU only, no GPU.
+# Mirrors train_modal.py::prep — builds episode windows via build_verl_batch
+# and writes train/val parquet + test JSONLs onto a persistent EBS volume
+# that the training task (gpt_oss_grpo.yaml) mounts read-only.
+#
+# Usage:
+#   sky launch -c mh-data sky/prep.yaml
+
+resources:
+  cloud: aws
+  cpus: 4+
+  memory: 16+
+  use_spot: false
+
+file_mounts:
+  /mnt/mh-data:
+    name: mh-data-478499050241
+    store: s3   # SkyPilot-managed bucket; mounted on the GPU job too
+    mode: MOUNT
+
+  /root/repo/agent_loop.py: ./agent_loop.py
+  /root/repo/mh_types.py: ./mh_types.py
+  /root/repo/memory_fs.py: ./memory_fs.py
+  /root/repo/ledger.py: ./ledger.py
+  /root/repo/harness_state.py: ./harness_state.py
+  /root/repo/data: ./data
+
+setup: |
+  pip install pandas pyarrow
+
+run: |
+  cd /root/repo
+  python3 - <<'PYEOF'
+  import json, random, sys
+  from pathlib import Path
+  import pandas as pd
+
+  sys.path.insert(0, "/root/repo")
+  from agent_loop import build_verl_batch
+
+  DATA = Path("/root/repo/data")
+  OUT  = Path("/mnt/mh-data")
+  OUT.mkdir(parents=True, exist_ok=True)
+
+  train_path = DATA / "train.jsonl"
+  if not train_path.exists():
+      print(f"Missing {train_path} — run data/download_data.py locally first "
+            f"and commit/sync data/*.jsonl before launching this task.")
+      sys.exit(1)
+
+  trajectories = [json.loads(l) for l in train_path.read_text().strip().split("\n") if l.strip()]
+
+  random.seed(42)
+  random.shuffle(trajectories)
+  cut = max(1, int(len(trajectories) * 0.9))
+  train_trajs, val_trajs = trajectories[:cut], trajectories[cut:]
+  if not val_trajs:
+      val_trajs = train_trajs
+
+  train_examples = build_verl_batch(train_trajs)
+  val_examples   = build_verl_batch(val_trajs)
+
+  print(f"Trajectories — train: {len(train_trajs)}, val: {len(val_trajs)}")
+  print(f"Episode windows — train: {len(train_examples)}, val: {len(val_examples)}")
+
+  pd.DataFrame(train_examples).to_parquet(OUT / "train.parquet", index=False)
+  pd.DataFrame(val_examples).to_parquet(OUT / "val.parquet", index=False)
+
+  for name in ("locomo_test", "longmemeval_test"):
+      src = DATA / f"{name}.jsonl"
+      if src.exists():
+          (OUT / f"{name}.jsonl").write_text(src.read_text())
+          print(f"Stored test data: {name} -> {OUT / f'{name}.jsonl'}")
+
+  print("Prep done.")
+  PYEOF
