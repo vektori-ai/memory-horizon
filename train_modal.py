@@ -1,4 +1,4 @@
-"""GRPO memory training on Modal — Qwen3-8B with verl + SGLang (v0.5.0).
+"""GRPO memory training on Modal — Qwen3-4B with verl + SGLang (v0.5.0).
 
 Run locally:
     modal run train_modal.py            # prep data + train
@@ -26,8 +26,8 @@ TEST_PATHS_LOCAL     = {
     "longmemeval":  REPO_ROOT / "data" / "longmemeval_test.jsonl",
 }
 
-MODEL_ID    = "Qwen/Qwen3-8B"
-N_ROLLOUTS  = 2      # completions per prompt (4 OOMs at 20-turn episodes; 2 halves KV pressure)
+MODEL_ID    = "Qwen/Qwen3-4B"
+N_ROLLOUTS  = 4      # completions per prompt; 4B is small enough to afford 4 rollouts
 N_STEPS     = 500
 
 # Context-1 retrieval service — deploy context1_service.py first, then paste the URL here.
@@ -148,12 +148,12 @@ def prep(jsonl_data: str, test_jsonls: dict[str, str] | None = None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# SFT — fine-tune Qwen3-8B on GPT-OSS-generated memory op demonstrations
+# SFT — fine-tune Qwen3-4B on GPT-OSS-generated memory op demonstrations
 # ---------------------------------------------------------------------------
 
 @app.function(
     image=sft_image,
-    gpu="A100-80GB:2",
+    gpu="A100-80GB:1",
     timeout=3 * 60 * MINUTES,
     volumes={
         MODELS_PATH: checkpoints_volume,
@@ -341,7 +341,7 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS, base_mod
         if not _cfg.get("use_cache", True):
             _cfg["use_cache"] = True
             changed = True
-        # Restore correct Qwen3-8B rope_theta if the checkpoint clobbered it
+        # Restore correct Qwen3-4B rope_theta if the checkpoint clobbered it
         if _cfg.get("rope_theta") == 10000.0 and _cfg.get("model_type") == "qwen3":
             _cfg["rope_theta"] = 1000000.0
             changed = True
@@ -357,39 +357,42 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS, base_mod
         # data
         f"data.train_files={DATA_PATH / 'train.parquet'}",
         f"data.val_files={DATA_PATH / 'val.parquet'}",
-        "data.train_batch_size=4",       # prompts per step; total rollouts = 4 × N_ROLLOUTS (dense probe windows need fewer concurrent seqs)
-        "data.max_prompt_length=2048",
-        "data.max_response_length=1024",
+        "data.train_batch_size=8",
+        "data.val_batch_size=8",         # must be explicit; None → 0 → ValueError in BatchSampler
+        "data.max_prompt_length=4096",   # <__ep__> gzip-compressed blob; prompts are 1600-4100 tokens
+        "data.max_response_length=4096", # multi-turn: 10 turns×(resp+obs) ~2500 tokens + probes ~500; pad budget must cover the full episode
         "data.filter_overlong_prompts=True",
         "data.truncation=right",
-        # model — no LoRA for now (LoRA PEFT keys break SGLang weight transfer;
-        # tracking in patch_verl.py as a follow-up). Full-model training with
-        # FSDP+CPU offload: 16GB weights + 32GB Adam on CPU, fits on A100-80GB:2.
+        # model — 4B weights = ~8GB bf16; fits on 1×A100-80GB with room for Adam states
+        # and SGLang KV cache without CPU offloading.
         f"actor_rollout_ref.model.path={base_model_path}",
         "actor_rollout_ref.model.use_remove_padding=True",
         "actor_rollout_ref.model.enable_gradient_checkpointing=True",
         # actor
-        f"actor_rollout_ref.actor.optim.lr=1e-4",
+        "actor_rollout_ref.actor.optim.lr=1e-5",           # was 3e-5; further reduced — run_016 step 4 grad_norm=3.69 still overshot
         "actor_rollout_ref.actor.ppo_mini_batch_size=4",
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2",
         "actor_rollout_ref.actor.use_kl_loss=True",
-        "actor_rollout_ref.actor.kl_loss_coef=0.001",
+        "actor_rollout_ref.actor.kl_loss_coef=0.01",      # was 0.001; increased 10× to resist mode collapse
         "actor_rollout_ref.actor.kl_loss_type=low_var_kl",
-        "actor_rollout_ref.actor.entropy_coeff=0",
-        "actor_rollout_ref.actor.fsdp_config.param_offload=True",
-        "actor_rollout_ref.actor.fsdp_config.optimizer_offload=True",
+        "actor_rollout_ref.actor.entropy_coeff=0.0",        # entropy bonus removed — combined with temp=1.5 it caused runaway to entropy=11.8 nats
+        # 2×A100: each GPU holds sharded half of 4B (4GB) + KV cache + Adam.
+        # FSDP sharding halves the per-GPU weight + Adam footprint, giving plenty
+        # of headroom without CPU offloading.
+        "actor_rollout_ref.actor.fsdp_config.param_offload=False",
+        "actor_rollout_ref.actor.fsdp_config.optimizer_offload=False",
         # rollout (SGLang — verl v0.5.0)
-        # TP=1: each GPU runs its own independent SGLang server (no TP collective
-        # ops during init). Full model per GPU (16GB) + KV (0.35×80=28GB) = 44GB,
-        # fits 80GB. TP=2 was crashing during NCCL init before any training step.
+        # Each GPU runs its own SGLang server (TP=1). 4GB sharded model + 0.45×80=36GB KV = 40GB,
+        # plus ~12GB for Adam/grads = ~52GB per GPU ✓
         "actor_rollout_ref.rollout.name=sglang",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.35",
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.45",
         "actor_rollout_ref.rollout.free_cache_engine=True",
         "actor_rollout_ref.rollout.enforce_eager=True",
         "++actor_rollout_ref.rollout.engine_kwargs.sglang.disable_cuda_graph=true",
         "actor_rollout_ref.rollout.multi_stage_wake_up=True",
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2",
+        "actor_rollout_ref.rollout.temperature=1.1",   # gentle diversity boost; 1.5 exploded entropy to 11.8 nats (random), 1.1 is conservative
         f"actor_rollout_ref.rollout.n={N_ROLLOUTS}",
         # multi-turn AgentLoop — mode=async is required: verl's AgentLoop registry/
         # agent_name routing is only consulted under async rollout (default is
@@ -413,7 +416,7 @@ def train(run_name: str = "locomo_lme_run_001", n_steps: int = N_STEPS, base_mod
         "actor_rollout_ref.actor.use_torch_compile=False",
         "actor_rollout_ref.ref.use_torch_compile=False",
         # ref model
-        "actor_rollout_ref.ref.fsdp_config.param_offload=True",
+        "actor_rollout_ref.ref.fsdp_config.param_offload=False",
         "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2",
         # trainer — val_before_train=False skips the initial _validate() that OOMs on
         # first SGLang wake_up (KV cache alloc) before FSDP has freed its GPU memory
@@ -592,34 +595,36 @@ def prep_data():
 
 
 @app.local_entrypoint()
-def sanity():
+def sanity(base_model_path: str = MODEL_ID):
     """Sanity run — 20 steps on existing parquet. Confirms the full pipeline works (~$7).
 
     Run: modal run train_modal.py::sanity
+    With SFT checkpoint: modal run train_modal.py::sanity --base-model-path /models/sft_warmup_merged
     """
     import time
     run_name = f"sanity_{int(time.time())}"   # unique name prevents resume from old checkpoint
-    print(f"Starting sanity run (20 steps, name={run_name})...")
+    print(f"Starting sanity run (20 steps, name={run_name}, model={base_model_path})...")
     jsonl_data  = DATA_PATH_LOCAL.read_text()
     test_jsonls = {k: p.read_text() for k, p in TEST_PATHS_LOCAL.items() if p.exists()}
     prep.remote(jsonl_data=jsonl_data, test_jsonls=test_jsonls)
-    result = train.remote(run_name=run_name, n_steps=20)
+    result = train.remote(run_name=run_name, n_steps=20, base_model_path=base_model_path)
     print("Sanity run done:", result)
 
 
 @app.local_entrypoint()
 def train_only(base_model_path: str = MODEL_ID):
-    """Train using existing parquet on the data volume (skips data prep).
+    """Rebuild parquet (picks up <__ep__> markers) then run GRPO.
 
-    Defaults to base Qwen3-8B (simplest path — use this to test whether the
-    OOM is from the SFT checkpoint config). Override with:
+    Override model with:
         --base-model-path /models/sft_warmup_merged
-    to warm-start from the SFT checkpoint once the base run is confirmed working.
     """
-    print("Starting GRPO training...")
-    kwargs = {"run_name": "locomo_lme_run_004", "base_model_path": base_model_path}
-    print(f"Starting from: {base_model_path}")
-    result = train.remote(**kwargs)
+    print("Rebuilding parquet data (picks up <__ep__> embedding fix)...")
+    jsonl_data  = DATA_PATH_LOCAL.read_text()
+    test_jsonls = {k: p.read_text() for k, p in TEST_PATHS_LOCAL.items() if p.exists()}
+    prep.remote(jsonl_data=jsonl_data, test_jsonls=test_jsonls)
+
+    print(f"Starting GRPO from: {base_model_path}")
+    result = train.remote(run_name="locomo_lme_run_018", base_model_path=base_model_path)
     print("Done:", result)
 
 

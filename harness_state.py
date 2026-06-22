@@ -119,12 +119,12 @@ class MemoryHarnessState:
     def compute_reward(self) -> float:
         """Final episode reward.
 
-        reward = mean(probe_scores)           # token-F1 on QA probes (0 → 1)
-               + format_penalty               # -0.02 per invalid op, capped at -0.10
+        reward = mean(probe_scores)   # token-F1 on QA probes, clamped to [0, 1]
 
-        Probe quality is the entire signal. Step-level ledger rewards and diversity
-        bonuses were removed: they had the same value for most rollouts in a group
-        (constant → zero GRPO gradient) and added noise to the advantage estimates.
+        Format penalty removed: negative rewards caused large gradient steps that
+        collapsed entropy (0.075 → 0.013) by step 3 in run_015. Rewards stay in
+        [0, 1] — format compliance is learned implicitly since garbage output gives
+        token-F1 ≈ 0 anyway.
 
         Returns 0.0 when no probes were answered (truncated/empty transcript).
         """
@@ -132,12 +132,7 @@ class MemoryHarnessState:
             return 0.0
 
         probe_score = sum(self.probe_scores) / len(self.probe_scores)
-
-        n_invalid   = self.op_counts.get("INVALID", 0)
-        fmt_penalty = max(FORMAT_PENALTY_MAX, FORMAT_PENALTY_PER_OP * n_invalid)
-
-        reward = probe_score + fmt_penalty
-        return float(max(-1.0, min(1.0, reward)))
+        return float(max(0.0, min(1.0, probe_score)))
 
     # ------------------------------------------------------------------
     # Logging helpers

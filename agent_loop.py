@@ -191,10 +191,37 @@ def build_verl_batch(
                 continue
 
             first_turn = window[0]
-            rest_turns = window[1:]
+            # Truncate long turns to keep the gzip-compressed <__ep__> payload
+            # small enough that all windows fit within max_prompt_length=4096.
+            # Very long turns (articles, docs) tokenize to 400-4000 tokens; the
+            # model can't meaningfully process >800 chars per turn in a 512-token
+            # response anyway.
+            _MAX_TURN_CHARS = 800
+            rest_turns = [
+                {**t, "content": t["content"][:_MAX_TURN_CHARS]}
+                for t in window[1:]
+            ]
+
+            # Embed episode data in the system message so the agent loop can read it
+            # even when verl's extra_info channel malfunctions (verl v0.5.0 calls
+            # extra_info.strip() before json.loads(), which crashes on a Python dict).
+            # We strip the marker before any generation call so the model never sees it.
+            # gzip before base64: JSON compresses 3-5x, cutting prompt tokens from
+            # ~4000-7500 down to ~600-1500 so all samples pass max_prompt_length=4096.
+            import base64 as _b64, gzip as _gz
+            _ep_json = json.dumps({
+                "rest_turns":         rest_turns,
+                "qa_probes":          scoreable,
+                "window_session_ids": list(window_session_ids),
+                "trajectory_id":      traj_id,
+                "window_start":       win_start,
+                "context1_url":       "",
+            }).encode()
+            _ep_payload = _b64.b64encode(_gz.compress(_ep_json, compresslevel=6)).decode()
+            _system_with_ep = _SYSTEM_PROMPT + f"\n<__ep__>{_ep_payload}</__ep__>"
 
             prompt = [
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": _system_with_ep},
                 {"role": "user",   "content": _format_turn(first_turn)},
             ]
 
@@ -214,8 +241,8 @@ def build_verl_batch(
                     "rest_turns":         rest_turns,
                     "qa_probes":          scoreable,
                     "window_session_ids": list(window_session_ids),
-                    "sessions":           sessions,   # needed by derive_ledger
-                    "context1_url":       "",  # filled in by train_modal.py at prep time
+                    "sessions":           sessions,
+                    "context1_url":       "",
                 },
             })
 
@@ -277,24 +304,71 @@ class MemoryAgentLoop(_MemoryAgentLoopBase):
         if _AgentLoopBase is None:
             raise ImportError("verl not installed — MemoryAgentLoop requires verl v0.5.0")
 
-        # verl calls extra_info.strip() before json.loads() — it expects a JSON string.
-        # Accept both str (verl already decoded it) and dict (passed directly).
-        raw_extra = sampling_params.get("extra_info", "{}")
-        if isinstance(raw_extra, str):
+        # verl tracks total tokens generated across all server_manager.generate() calls
+        # and decrements sampling_params.max_new_tokens after each call. In a multi-turn
+        # episode (10 conv turns + probes), this budget hits 0 and goes negative → ValueError.
+        # Fix: create a per-call copy with a fresh max_new_tokens each time we generate.
+        import copy as _copy
+        def _sp_with_budget(budget: int):
             try:
-                extra = json.loads(raw_extra)
-            except (json.JSONDecodeError, TypeError):
-                extra = {}
-        elif isinstance(raw_extra, dict):
-            extra = raw_extra
-        else:
-            extra = {}
+                sp = _copy.copy(sampling_params)
+                try:
+                    sp["max_new_tokens"] = budget      # dict-like
+                except TypeError:
+                    sp.max_new_tokens = budget          # dataclass/object
+                return sp
+            except Exception:
+                return sampling_params
+        _CONV_BUDGET  = 512   # tokens per conv-turn response
+        _PROBE_BUDGET = 512   # tokens per probe response
+
+        # Extract episode data from the <__ep__> marker embedded in the system message.
+        # verl v0.5.0 calls extra_info.strip() before json.loads() in generate_sequences(),
+        # which crashes on a Python dict and silently returns {}. Embedding data in the
+        # prompt bypasses this — messages IS correctly passed to run(). The marker is
+        # stripped before any generate call so the model never sees it.
+        import re as _re, base64 as _b64, gzip as _gz
+        _ep_re = _re.compile(r'<__ep__>(.*?)</__ep__>', _re.DOTALL)
+        extra = {}
+        for _msg in messages:
+            if _msg.get("role") == "system":
+                _m = _ep_re.search(_msg.get("content", ""))
+                if _m:
+                    try:
+                        _raw_bytes = _b64.b64decode(_m.group(1))
+                        # Support both gzip-compressed (new) and plain (old) payloads
+                        try:
+                            extra = json.loads(_gz.decompress(_raw_bytes).decode())
+                        except Exception:
+                            extra = json.loads(_raw_bytes.decode())
+                    except Exception:
+                        pass
+                break
+
+        # Also check sampling_params["extra_info"] as fallback (in case verl fixes it).
+        if not extra:
+            _raw = sampling_params.get("extra_info", {})
+            if isinstance(_raw, str):
+                try:
+                    extra = json.loads(_raw)
+                except Exception:
+                    extra = {}
+            elif isinstance(_raw, dict):
+                extra = _raw
 
         rest_turns   = extra.get("rest_turns", [])
         qa_probes    = extra.get("qa_probes", [])
         window_sids  = set(extra.get("window_session_ids", []))
         context1_url = extra.get("context1_url") or None
         sessions     = extra.get("sessions", [])
+
+        # Strip the marker before any generate call.
+        def _clean(msgs: list) -> list:
+            return [
+                {**m, "content": _ep_re.sub("", m["content"]).strip()}
+                if m.get("role") == "system" else m
+                for m in msgs
+            ]
 
         if window_sids:
             filtered = [
@@ -325,23 +399,35 @@ class MemoryAgentLoop(_MemoryAgentLoopBase):
         all_resp_mask    = []
         all_responses    = []
         turn_offset      = extra.get("first_turn", {}).get("turn_idx", 0)
-        current_messages = list(messages)
+        current_messages = _clean(list(messages))
 
         # ── Conversation turns phase ───────────────────────────────────────
+        # Two guards prevent conv turns from consuming the entire response budget:
+        #  1. _MAX_CONV_PROMPT: sglang computes max_new_tokens = (max_prompt_len +
+        #     max_response_len) - len(prompt_ids); if prompt exceeds budget → negative.
+        #  2. _MAX_CONV_RESP: probe phase needs room in all_resp_ids (probe markers +
+        #     resolve ids) within the 4096 truncation limit. Capping conv tokens at ~1500
+        #     guarantees probes fit even when model generates verbose conv responses.
+        _MAX_CONV_PROMPT = 7680  # 8192 - 512 slack
+        _MAX_CONV_RESP   = 1500  # lowered from 2048: ensures probe phase always has budget
         for step_idx in range(1 + len(rest_turns)):
             # AgentLoopBase doesn't expose a self.tokenize()/self.generate() convenience
             # API (verified against verl's own SingleTurnAgentLoop/ToolAgentLoop) — real
             # subclasses go through self.tokenizer / self.server_manager directly.
             step_prompt_ids = self.tokenizer.apply_chat_template(
-                current_messages, add_generation_prompt=True, tokenize=True
+                current_messages, add_generation_prompt=True, tokenize=True,
+                enable_thinking=False,
             )
             if step_idx == 0:
                 all_prompt_ids = step_prompt_ids
+            elif len(step_prompt_ids) > _MAX_CONV_PROMPT or len(all_resp_ids) > _MAX_CONV_RESP:
+                # Context window or response budget full — stop conv turns, preserve probe phase.
+                break
 
             response_ids = await self.server_manager.generate(
                 request_id=uuid.uuid4().hex,
                 prompt_ids=step_prompt_ids,
-                sampling_params=sampling_params,
+                sampling_params=_sp_with_budget(_CONV_BUDGET),
             )
             response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
             all_responses.append(response_text)
@@ -387,7 +473,18 @@ class MemoryAgentLoop(_MemoryAgentLoopBase):
                     ]
 
         # ── Probe / RESOLVE phase ──────────────────────────────────────────
+        # Each probe adds ~80 (marker) + ~200 (resolve) = ~280 tokens. With up to
+        # 23 probes per episode, that overflows the 4096 response budget, clips all
+        # question markers out of solution_str, and makes rewards=0 for that batch.
+        # Stop adding probes once we're within 400 tokens of the truncation limit.
+        # Skip the guard for the FIRST probe to guarantee at least one probe score,
+        # preventing probe_scores=[] → compute_reward()=0.0 for all rollouts → advantages=0.
+        _MAX_PROBE_RESP = 3696   # _MAX_RESP(4096) - 400 slack; leave room for probe marker+resolve
+        probe_count = 0
         for probe in qa_probes:
+            if probe_count > 0 and len(all_resp_ids) >= _MAX_PROBE_RESP:
+                break  # no room for another probe marker + resolve
+
             question = probe.get("question", "") if isinstance(probe, dict) else getattr(probe, "question", "")
             answer   = str(probe.get("answer", "") if isinstance(probe, dict) else getattr(probe, "answer", ""))
             if not answer or answer.lower() in ("abstain", "yes", "no", "n/a", ""):
@@ -399,14 +496,26 @@ class MemoryAgentLoop(_MemoryAgentLoopBase):
                 f"[Retrieved]\n{retrieved or '(no relevant entries found)'}\n\n"
                 f"[Question]\n{question}"
             )
-            probe_messages   = current_messages + [{"role": "user", "content": probe_obs}]
+            # Use a fresh 2-message context for probes (system + probe_obs only).
+            # Including the full conversation history (current_messages) pushes
+            # probe_prompt_ids > max_prompt_length + max_response_length, causing
+            # verl to compute max_new_tokens = budget - len(prompt) < 0 → ValueError.
+            # The memory FS state in probe_obs already captures all relevant info.
+            clean_system = _ep_re.sub("", messages[0]["content"]).strip() if messages else _SYSTEM_PROMPT
+            probe_messages   = [
+                {"role": "system", "content": clean_system},
+                {"role": "user",   "content": probe_obs},
+            ]
             probe_prompt_ids = self.tokenizer.apply_chat_template(
-                probe_messages, add_generation_prompt=True, tokenize=True
+                probe_messages, add_generation_prompt=True, tokenize=True,
+                enable_thinking=False,
             )
+            # reward.py extracts RESOLVE ops by position order (not by question anchor),
+            # so no probe marker needed in all_resp_ids — just the model's resolve response.
             resolve_ids = await self.server_manager.generate(
                 request_id=uuid.uuid4().hex,
                 prompt_ids=probe_prompt_ids,
-                sampling_params=sampling_params,
+                sampling_params=_sp_with_budget(_PROBE_BUDGET),
             )
             resolve_text = self.tokenizer.decode(resolve_ids, skip_special_tokens=True)
 
@@ -421,6 +530,7 @@ class MemoryAgentLoop(_MemoryAgentLoopBase):
                 else resolve_text.strip()   # fallback: treat raw text as answer
             )
             harness.apply_resolve(resolve_content, answer)
+            probe_count += 1
 
         # harness.summary() (below) computes harness.compute_reward() itself and logs
         # it to WandB as episode/reward — purely diagnostic. Confirmed against verl
@@ -429,10 +539,28 @@ class MemoryAgentLoop(_MemoryAgentLoopBase):
         # always computed downstream by the reward manager calling
         # custom_reward_function (reward.py::compute_reward) on the decoded response
         # text, never returned from run(). reward.py independently replays this same
-        # transcript (replay_and_score) to recompute an equivalent score for the
-        # actual training signal — this method's return value never reaches verl.
         summary = harness.summary()
         _log_episode_stats(all_responses, summary)
+
+        # Embed the pre-computed reward as a short ASCII prefix at the FRONT of the
+        # response so reward.py can read it without any text extraction or JSON parsing.
+        # harness.compute_reward() uses probe_scores computed by apply_resolve() with
+        # a raw-text fallback, so it's robust to non-JSON model outputs.
+        # Format: "R:{bucket:03d};" where bucket = int(reward * 127 + 128), giving
+        # range [-1.0, 1.0] mapped to [1, 255] (bucket 128 = reward 0.0).
+        # Short fixed-width ASCII guarantees stable tokenization round-trips.
+        episode_reward = harness.compute_reward()
+        bucket = max(1, min(255, int(episode_reward * 127 + 128)))
+        reward_prefix_str = f"R:{bucket:03d};"
+        reward_prefix_ids = self.tokenizer.encode(reward_prefix_str, add_special_tokens=False)
+
+        # Truncate episode to data.max_response_length (4096) — verl's _postprocess()
+        # pads response_ids to exactly this length; any overage → shape mismatch.
+        _MAX_RESP = 4096
+        episode_ids  = all_resp_ids[:_MAX_RESP - len(reward_prefix_ids)]
+        episode_mask = all_resp_mask[:_MAX_RESP - len(reward_prefix_ids)]
+        all_resp_ids  = reward_prefix_ids + episode_ids
+        all_resp_mask = [0] * len(reward_prefix_ids) + episode_mask
 
         # num_turns mirrors what verl's shipped SingleTurnAgentLoop/ToolAgentLoop both
         # populate (informational/logging — write+retrieve steps plus probe steps).
