@@ -55,8 +55,8 @@ class VirtualFilesystem:
             return
 
         op_type = op.get("op", "")
-        path    = op.get("path", "").strip()
-        content = op.get("content", "").strip()
+        path    = str(op.get("path",    "") or "").strip()
+        content = str(op.get("content", "") or "").strip()
 
         if op_type not in _WRITE_OPS or not path or not content:
             return
