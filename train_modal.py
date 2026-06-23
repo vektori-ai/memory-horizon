@@ -624,7 +624,19 @@ def train_only(base_model_path: str = MODEL_ID):
     prep.remote(jsonl_data=jsonl_data, test_jsonls=test_jsonls)
 
     print(f"Starting GRPO from: {base_model_path}")
-    result = train.remote(run_name="locomo_lme_run_021", base_model_path=base_model_path)
+    result = train.remote(run_name="locomo_lme_run_022", base_model_path=base_model_path)
+    print("Done:", result)
+
+
+@app.local_entrypoint()
+def run_022(base_model_path: str = MODEL_ID):
+    """Launch run_022 skipping prep (data already on /data volume).
+
+    Use this with --detach to keep training alive after local disconnect:
+        modal run --detach train_modal.py::run_022
+    """
+    print(f"Starting GRPO run_022 from: {base_model_path}")
+    result = train.remote(run_name="locomo_lme_run_022", base_model_path=base_model_path)
     print("Done:", result)
 
 

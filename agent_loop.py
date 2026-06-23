@@ -450,7 +450,9 @@ class MemoryAgentLoop(_MemoryAgentLoopBase):
                 ]
             else:
                 # All write ops (STORE_FACT, UPDATE, SUPERSEDE, COMPRESS, ABSTAIN)
-                harness.apply_op(op, session_idx=session_idx, turn_idx=turn_offset + step_idx)
+                cur_turn = rest_turns[step_idx - 1] if step_idx > 0 else extra.get("first_turn", {})
+                s_idx = cur_turn.get("session_idx", 0) if isinstance(cur_turn, dict) else 0
+                harness.apply_op(op, session_idx=s_idx, turn_idx=turn_offset + step_idx)
 
                 if step_idx < len(rest_turns):
                     next_turn   = rest_turns[step_idx]
