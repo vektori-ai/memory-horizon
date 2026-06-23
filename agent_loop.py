@@ -529,7 +529,7 @@ class MemoryAgentLoop(_MemoryAgentLoopBase):
                 if resolve_op and resolve_op.get("op") == "RESOLVE"
                 else resolve_text.strip()   # fallback: treat raw text as answer
             )
-            harness.apply_resolve(resolve_content, answer)
+            harness.apply_resolve(resolve_content, answer, question=question)
             probe_count += 1
 
         # harness.summary() (below) computes harness.compute_reward() itself and logs
@@ -589,25 +589,84 @@ if _register is not None:
 # ---------------------------------------------------------------------------
 
 def _log_episode_stats(responses: list[str], summary: dict) -> None:
-    """Log per-episode stats to WandB if a run is active."""
+    """Log per-episode stats to WandB + stdout."""
+    reward       = summary.get("final_reward", 0.0)
+    probe_traces = summary.get("probe_traces", [])
+    probe_scores = summary.get("probe_scores", [])
+    op_counts    = summary.get("op_counts", {})
+    op_sequence  = summary.get("op_sequence", [])
+    fs_snapshot  = summary.get("fs_snapshot", "")
+    n_ops        = max(sum(op_counts.values()), 1)
+
+    # Always print a compact trace so Modal logs are inspectable
+    _print_episode_trace(reward, probe_traces, op_sequence, fs_snapshot)
+
     try:
         import wandb
         if not wandb.run:
             return
-        op_counts = summary.get("op_counts", {})
-        n         = max(sum(op_counts.values()), 1)
-        wandb.log({
-            "episode/reward":          summary.get("final_reward", 0.0),
-            "episode/mean_resolve":    summary.get("mean_resolve", 0.0),
-            "episode/mean_step":       summary.get("mean_step", 0.0),
-            "episode/n_retrievals":    summary.get("n_retrievals", 0),
-            "episode/n_fs_paths":      len(summary.get("fs_paths", [])),
-            "episode/abstain_rate":    op_counts.get("ABSTAIN", 0) / n,
-            "episode/store_rate":      op_counts.get("STORE_FACT", 0) / n,
-            "episode/update_rate":     (op_counts.get("UPDATE", 0) + op_counts.get("SUPERSEDE", 0)) / n,
-            "episode/retrieve_rate":   op_counts.get("RETRIEVE", 0) / n,
-            "episode/invalid_rate":    op_counts.get("INVALID", 0) / n,
-        })
+
+        metrics: dict = {
+            "episode/reward":        reward,
+            "episode/mean_resolve":  summary.get("mean_resolve", 0.0),
+            "episode/n_probes":      len(probe_scores),
+            "episode/n_retrievals":  summary.get("n_retrievals", 0),
+            "episode/n_fs_paths":    len(summary.get("fs_paths", [])),
+            "episode/n_confirmed":   summary.get("n_confirmed", 0),
+            "episode/n_tentative":   summary.get("n_tentative", 0),
+            # op distribution
+            "episode/store_rate":    op_counts.get("STORE_FACT", 0) / n_ops,
+            "episode/update_rate":   (op_counts.get("UPDATE", 0) + op_counts.get("SUPERSEDE", 0)) / n_ops,
+            "episode/abstain_rate":  op_counts.get("ABSTAIN", 0) / n_ops,
+            "episode/retrieve_rate": op_counts.get("RETRIEVE", 0) / n_ops,
+            "episode/invalid_rate":  op_counts.get("INVALID", 0) / n_ops,
+        }
+        # Individual probe scores p0..pN so we can see which probe positions are hard
+        for i, s in enumerate(probe_scores):
+            metrics[f"episode/probe_f1_p{i}"] = s
+
+        wandb.log(metrics)
+
+        # Log probe trace table for episodes with any non-zero score
+        if probe_traces and any(t["f1"] > 0 for t in probe_traces):
+            table = wandb.Table(columns=["question", "model_answer", "gold", "f1"])
+            for t in probe_traces:
+                table.add_data(t["question"], t["model_answer"], t["gold"], t["f1"])
+            wandb.log({"episode/probe_table": table})
+
+        # Log VFS snapshot for high-reward episodes
+        if reward > 0.2 and fs_snapshot:
+            wandb.log({"episode/vfs_snapshot": wandb.Html(f"<pre>{fs_snapshot}</pre>")})
+
+    except Exception:
+        pass
+
+
+def _print_episode_trace(
+    reward: float,
+    probe_traces: list[dict],
+    op_sequence: list[str],
+    fs_snapshot: str,
+) -> None:
+    """Print a compact human-readable episode trace to stdout (visible in Modal logs)."""
+    try:
+        # Op sequence summary e.g. "STORE×3 ABSTAIN×2 INVALID×1"
+        from collections import Counter as _Counter
+        op_summary = "  ".join(
+            f"{op}×{cnt}" for op, cnt in _Counter(op_sequence).most_common()
+        ) or "(no ops)"
+
+        lines = [
+            f"[EP] reward={reward:.3f}  ops=[{op_summary}]  probes={len(probe_traces)}",
+        ]
+        for i, t in enumerate(probe_traces):
+            lines.append(
+                f"  P{i} f1={t['f1']:.3f} | Q: {t['question'][:80]} "
+                f"| pred: {t['model_answer'][:60]} | gold: {t['gold'][:60]}"
+            )
+        if fs_snapshot and reward > 0.05:
+            lines.append(f"  VFS: {fs_snapshot[:200].replace(chr(10), ' | ')}")
+        print("\n".join(lines), flush=True)
     except Exception:
         pass
 

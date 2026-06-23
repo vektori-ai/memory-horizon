@@ -58,6 +58,8 @@ class MemoryHarnessState:
     op_counts:       Counter              = field(default_factory=Counter)
     step_rewards:    list[float]          = field(default_factory=list)
     probe_scores:    list[float]          = field(default_factory=list)
+    probe_traces:    list[dict[str, Any]] = field(default_factory=list)  # {q, model_ans, gold, f1}
+    op_sequence:     list[str]            = field(default_factory=list)   # op type per conv turn
     current_session: str | None           = None
 
     # ------------------------------------------------------------------
@@ -77,6 +79,7 @@ class MemoryHarnessState:
         """Apply op to FS, track op counts. Returns small step signal."""
         op_type = op.get("op", "INVALID") if isinstance(op, dict) else "INVALID"
         self.op_counts[op_type] += 1
+        self.op_sequence.append(op_type)
 
         if op_type == "INVALID" or not isinstance(op, dict):
             r = FORMAT_PENALTY_PER_OP
@@ -105,10 +108,16 @@ class MemoryHarnessState:
     # RESOLVE
     # ------------------------------------------------------------------
 
-    def apply_resolve(self, answer: str, gold: str) -> float:
+    def apply_resolve(self, answer: str, gold: str, question: str = "") -> float:
         """Score a RESOLVE answer with token-F1."""
         score = _score_resolve(answer, gold)
         self.probe_scores.append(score)
+        self.probe_traces.append({
+            "question":     question[:300],
+            "model_answer": answer[:300],
+            "gold":         gold[:300],
+            "f1":           round(score, 4),
+        })
         self.op_counts["RESOLVE"] += 1
         return score
 
@@ -141,10 +150,13 @@ class MemoryHarnessState:
     def summary(self) -> dict[str, Any]:
         return {
             "probe_scores":  self.probe_scores,
+            "probe_traces":  self.probe_traces,
+            "op_sequence":   self.op_sequence,
             "mean_resolve":  sum(self.probe_scores) / max(len(self.probe_scores), 1),
             "op_counts":     dict(self.op_counts),
             "n_retrievals":  len(self.retrieval_log),
             "fs_paths":      list(self.fs.files.keys()),
+            "fs_snapshot":   self.fs.render_for_prompt()[:800],
             "n_confirmed":   sum(1 for t in self.fs.importance.values() if t == "confirmed"),
             "n_tentative":   sum(1 for t in self.fs.importance.values() if t == "tentative"),
             "final_reward":  self.compute_reward(),
