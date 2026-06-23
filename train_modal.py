@@ -641,6 +641,18 @@ def run_022(base_model_path: str = MODEL_ID):
 
 
 @app.local_entrypoint()
+def run_023(base_model_path: str = MODEL_ID):
+    """Launch run_023 — probe RESOLVE instruction fix (model outputs STORE_FACT at probe time).
+
+    Use with --detach:
+        modal run --detach train_modal.py::run_023
+    """
+    print(f"Starting GRPO run_023 from: {base_model_path}")
+    result = train.remote(run_name="locomo_lme_run_023", base_model_path=base_model_path)
+    print("Done:", result)
+
+
+@app.local_entrypoint()
 def main():
     if not DATA_PATH_LOCAL.exists():
         print(f"Data not found at {DATA_PATH_LOCAL}")

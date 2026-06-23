@@ -490,7 +490,10 @@ class MemoryAgentLoop(_MemoryAgentLoopBase):
             probe_obs = (
                 f"\n[Memory state]\n{harness.render_context()}\n\n"
                 f"[Retrieved]\n{retrieved or '(no relevant entries found)'}\n\n"
-                f"[Question]\n{question}"
+                f"[Question]\n{question}\n\n"
+                f"[Instruction] Answer the question above using only what is in [Memory state] and [Retrieved]. "
+                f"Output ONLY: {{\"op\": \"RESOLVE\", \"content\": \"<your answer>\"}}\n"
+                f"Do NOT output STORE_FACT, UPDATE, RETRIEVE, or any other op. Just RESOLVE."
             )
             # Use a fresh 2-message context for probes (system + probe_obs only).
             # Including the full conversation history (current_messages) pushes
