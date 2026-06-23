@@ -128,12 +128,15 @@ class MemoryHarnessState:
     def compute_reward(self) -> float:
         """Final episode reward.
 
-        reward = mean(probe_scores)   # token-F1 on QA probes, clamped to [0, 1]
+        reward = probe_score + vfs_bonus
 
-        Format penalty removed: negative rewards caused large gradient steps that
-        collapsed entropy (0.075 → 0.013) by step 3 in run_015. Rewards stay in
-        [0, 1] — format compliance is learned implicitly since garbage output gives
-        token-F1 ≈ 0 anyway.
+        probe_score: mean token-F1 across RESOLVE answers (0→1). Primary signal.
+
+        vfs_bonus: +0.01 per unique VFS path written (confirmed or tentative),
+        capped at +0.05. Incentivises the model to write valid STORE_FACT/UPDATE
+        ops without a format PENALTY (which caused entropy collapse in run_015-016).
+        Auto-seeding was removed so VFS starts empty — model gets 0 probe reward if
+        it never writes anything, giving a clean incentive to use the memory system.
 
         Returns 0.0 when no probes were answered (truncated/empty transcript).
         """
@@ -141,7 +144,12 @@ class MemoryHarnessState:
             return 0.0
 
         probe_score = sum(self.probe_scores) / len(self.probe_scores)
-        return float(max(0.0, min(1.0, probe_score)))
+
+        # Count paths the model actually wrote to (exclude _prior archive paths)
+        written_paths = [p for p in self.fs.files if not p.endswith("_prior")]
+        vfs_bonus = min(0.05, len(written_paths) * 0.01)
+
+        return float(max(0.0, min(1.0, probe_score + vfs_bonus)))
 
     # ------------------------------------------------------------------
     # Logging helpers

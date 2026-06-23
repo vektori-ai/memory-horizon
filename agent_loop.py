@@ -383,16 +383,10 @@ class MemoryAgentLoop(_MemoryAgentLoopBase):
         ledger  = derive_ledger(qa_probes, sessions)
         harness = MemoryHarnessState(ledger=ledger)
 
-        # Auto-seed FS from prior sessions (adapted from Harness-1's warm-start
-        # idea — see MemoryHarnessState.seed_from_sessions docstring for why
-        # the trigger condition deliberately differs, not a literal mirror).
-        # Avoids cold-start reward collapse: rollouts start with non-empty FS
-        # so reward variance exists from step 1 and GRPO gradient flows immediately.
-        session_idx = extra.get("first_turn", {}).get("session_idx", 0)
-        if session_idx > 0 and sessions:
-            harness.seed_from_sessions(sessions, seed_session_count=session_idx)
-        elif sessions:
-            harness.seed_from_sessions(sessions, seed_session_count=1)
+        # Auto-seeding removed: pre-populating VFS let the model answer probes from
+        # seeded facts without ever writing valid ops (all INVALID, VFS pre-filled).
+        # Now VFS starts empty — the model MUST write STORE_FACT/UPDATE/etc. during
+        # conv turns to have anything to retrieve at probe time.
 
         all_prompt_ids   = []
         all_resp_ids     = []
